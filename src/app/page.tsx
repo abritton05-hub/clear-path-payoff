@@ -1,1758 +1,1749 @@
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
+import { supabase } from "../lib/supabaseClient";
 
 /**
  * Clear Path Payoff — single-file build (Next.js App Router)
  * Paste into: src/app/page.tsx
  *
- * Notes:
- * - Demo auth is localStorage-based (NOT production secure yet).
- * - Pro-only: click into an account for details.
- * - Reduced ads for Pro: compact + only on Plan/Profile.
- * - Guest: big bright banner; nothing saves.
+ * Prototype storage:
+ * - Guest: nothing saves
+ * - Signed in: localStorage (users + accounts + settings)
+ * - Optional: Supabase password reset email if configured (otherwise local reset)
  */
 
-// ====== CONFIG ======
+// ===== Config =====
 const APP_NAME = "Clear Path Payoff";
-const MASTER_EMAIL = "abritton05@gmail.com"; // you always get Pro
+const TAGLINE = "Discipline scoreboard — simple now, smarter every version.";
+const MASTER_EMAIL = "abritton05@gmail.com";
 
-// localStorage keys
-const KEY_USERS = "cpp_users_v1";
-const KEY_SESSION = "cpp_session_v1";
-const KEY_ACCOUNTS_PREFIX = "cpp_accounts_v1_"; // + email
-const KEY_SETTINGS_PREFIX = "cpp_settings_v1_"; // + email
+// Promo (never display the actual code in UI)
+const PROMO_CODE_PRO = "Family83";
 
-type Plan = "basic" | "pro";
-type AccountType = "credit_card" | "loan";
-type Tab = "accounts" | "plan" | "stats" | "profile";
-type AuthMode = "signin" | "signup";
+// Storage keys
+const KEY_USERS = "cpp_users_v5";
+const KEY_SESSION = "cpp_session_v5";
+const KEY_ACCOUNTS_PREFIX = "cpp_accounts_v5_"; // + email
+const KEY_SETTINGS_PREFIX = "cpp_settings_v5_"; // + email
 
-type User = {
+type Plan = "guest" | "basic" | "pro";
+type Session = { email: string; plan: Exclude<Plan, "guest"> };
+
+type UserRec = {
   email: string;
-  password: string; // demo only
-  plan: Plan;
-  name: string;
+  createdAt: number;
+  plan: Exclude<Plan, "guest">;
+  passwordSalt: string;
+  passwordHash: string;
+  displayName?: string;
 };
 
-type Session = {
-  email: string;
-  plan: Plan;
-  name: string;
-  isGuest: boolean;
-};
+type AccountType = "Credit Card" | "Loan" | "Line of Credit" | "Other";
 
 type Account = {
   id: string;
-  type: AccountType;
   name: string;
-  apr: number;
+  type: AccountType;
   balance: number;
-  minPayment: number;
-  nextDueDay: number; // 1-31
-  creditLimit?: number;
+  limit: number; // user asked: include for both so % makes sense
+  apr: number; // %
+  minPay: number; // Next min payment
+  dueDate: number; // 1-31
+  notes?: string;
   createdAt: number;
 };
 
 type Settings = {
-  amountExtra: number; // monthly extra budget
-  method: "avalanche" | "snowball";
+  payoffStyle: "avalanche" | "snowball";
+  extraMonthly: number; // rolls forward (stored)
+  lastUpdatedAt: number;
 };
 
-// ====== HELPERS ======
-function normalizeEmail(email: string) {
-  return email.trim().toLowerCase();
+type AllocationRow = {
+  accountId: string;
+  name: string;
+  min: number;
+  extra: number;
+  total: number;
+};
+
+type MonthPlan = {
+  monthIndex: number; // 1-based
+  allocations: AllocationRow[];
+  totalMin: number;
+  totalExtra: number;
+  totalPaid: number;
+  totalInterest: number;
+  remainingDebt: number;
+};
+
+type SimResult = {
+  monthsToPayoff: number;
+  totalInterest: number;
+  firstTargetIds: string[]; // ranked order at start
+  monthPlans: MonthPlan[]; // can be partial (e.g., next 6)
+  stalled: boolean;
+};
+
+// ===== Helpers =====
+const clamp = (n: number, a: number, b: number) => Math.max(a, Math.min(b, n));
+const money = (n: number) =>
+  Number.isFinite(n)
+    ? n.toLocaleString(undefined, { style: "currency", currency: "USD" })
+    : "$0.00";
+
+function normalizeEmail(v: string) {
+  return v.trim().toLowerCase();
 }
-function safeParse<T>(raw: string | null, fallback: T): T {
-  if (!raw) return fallback;
+function isMaster(email: string) {
+  return normalizeEmail(email) === normalizeEmail(MASTER_EMAIL);
+}
+function computePlanFromEmail(email: string, stored?: Exclude<Plan, "guest">): Exclude<Plan, "guest"> {
+  return isMaster(email) ? "pro" : stored ?? "basic";
+}
+function uid() {
+  return `${Math.random().toString(16).slice(2)}-${Date.now().toString(16)}`;
+}
+function safeParse<T>(raw: string | null): T | null {
+  if (!raw) return null;
   try {
     return JSON.parse(raw) as T;
   } catch {
-    return fallback;
+    return null;
   }
 }
-function accountsKey(email: string) {
-  return KEY_ACCOUNTS_PREFIX + normalizeEmail(email);
+function lsGet<T>(key: string): T | null {
+  if (typeof window === "undefined") return null;
+  return safeParse<T>(window.localStorage.getItem(key));
 }
-function settingsKey(email: string) {
-  return KEY_SETTINGS_PREFIX + normalizeEmail(email);
+function lsSet(key: string, value: any) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(key, JSON.stringify(value));
 }
-function money(n: number) {
-  if (!isFinite(n)) return "$0.00";
-  return n.toLocaleString(undefined, { style: "currency", currency: "USD" });
-}
-function pct(n: number) {
-  if (!isFinite(n)) return "0%";
-  return `${n.toFixed(1)}%`;
-}
-function capWords(s: string) {
-  const t = (s ?? "").trim();
-  if (!t) return "";
-  return t
-    .split(/\s+/)
-    .map((w) => (w ? w[0].toUpperCase() + w.slice(1).toLowerCase() : ""))
-    .join(" ");
-}
-function uid() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+function lsDel(key: string) {
+  if (typeof window === "undefined") return;
+  window.localStorage.removeItem(key);
 }
 
-// ====== STORAGE ======
-function loadUsers(): User[] {
-  const raw = localStorage.getItem(KEY_USERS);
-  const parsed = safeParse<any>(raw, []);
-  if (!Array.isArray(parsed)) return [];
-  return parsed
-    .filter((u) => u && typeof u.email === "string" && typeof u.password === "string")
-    .map((u) => ({
-      email: normalizeEmail(u.email),
-      password: String(u.password),
-      plan: u.plan === "pro" ? "pro" : "basic",
-      name: typeof u.name === "string" ? u.name : normalizeEmail(u.email),
-    }));
+function ordinal(n: number) {
+  const v = n % 100;
+  if (v >= 11 && v <= 13) return `${n}th`;
+  const last = n % 10;
+  if (last === 1) return `${n}st`;
+  if (last === 2) return `${n}nd`;
+  if (last === 3) return `${n}rd`;
+  return `${n}th`;
 }
-function saveUsers(users: User[]) {
-  localStorage.setItem(KEY_USERS, JSON.stringify(users));
+
+function monthlyRate(aprPct: number) {
+  return (Math.max(0, aprPct) / 100) / 12;
 }
-function loadSession(): Session | null {
-  const raw = localStorage.getItem(KEY_SESSION);
-  const s = safeParse<any>(raw, null);
-  if (!s || typeof s !== "object") return null;
-  if (typeof s.email !== "string" || typeof s.plan !== "string" || typeof s.name !== "string") return null;
-  return {
-    email: normalizeEmail(s.email),
-    plan: s.plan === "pro" ? "pro" : "basic",
-    name: String(s.name),
-    isGuest: !!s.isGuest,
-  };
+
+function sum(nums: number[]) {
+  return nums.reduce((a, b) => a + b, 0);
 }
-function saveSession(session: Session | null) {
-  if (!session) localStorage.removeItem(KEY_SESSION);
-  else localStorage.setItem(KEY_SESSION, JSON.stringify(session));
+
+// ===== Crypto (salted SHA-256) =====
+function toHex(buf: ArrayBuffer) {
+  return Array.from(new Uint8Array(buf))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
-function loadAccounts(email: string): Account[] {
-  const raw = localStorage.getItem(accountsKey(email));
-  const parsed = safeParse<any>(raw, []);
-  if (!Array.isArray(parsed)) return [];
-  return parsed
-    .filter((a) => a && typeof a.id === "string" && typeof a.name === "string")
+function randomSalt(bytes = 16) {
+  const arr = new Uint8Array(bytes);
+  crypto.getRandomValues(arr);
+  return Array.from(arr)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+async function sha256(text: string) {
+  const enc = new TextEncoder().encode(text);
+  const hash = await crypto.subtle.digest("SHA-256", enc);
+  return toHex(hash);
+}
+async function hashPassword(password: string, salt: string) {
+  return sha256(`${salt}:${password}`);
+}
+function isStrongEnough(pw: string) {
+  return pw.length >= 8;
+}
+
+// ===== Parsing (no forced leading zeros, allows '.') =====
+function keepNumericChars(s: string, allowDot: boolean) {
+  let out = "";
+  let dotSeen = false;
+  for (const ch of s) {
+    if (ch >= "0" && ch <= "9") out += ch;
+    else if (allowDot && ch === "." && !dotSeen) {
+      out += ch;
+      dotSeen = true;
+    }
+  }
+  return out;
+}
+function parseMoneyLike(s: string) {
+  const cleaned = keepNumericChars(s, true);
+  if (cleaned === "" || cleaned === ".") return 0;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+function parsePercentLike(s: string) {
+  const cleaned = keepNumericChars(s, true);
+  if (cleaned === "" || cleaned === ".") return 0;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+function parseIntLike(s: string) {
+  const cleaned = keepNumericChars(s, false);
+  if (cleaned === "") return 0;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? Math.trunc(n) : 0;
+}
+function fmtMoneyInput(n: number) {
+  // show plain typing-friendly numeric string (no commas)
+  if (!Number.isFinite(n)) return "";
+  if (Math.abs(n) < 0.000001) return "";
+  // keep up to 2 decimals but trim trailing zeros
+  const s = n.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+  return s;
+}
+function fmtPercentInput(n: number) {
+  if (!Number.isFinite(n)) return "";
+  if (Math.abs(n) < 0.000001) return "";
+  const s = n.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+  return s;
+}
+
+// ===== Simulation (min everywhere, extra rolls into next target same month) =====
+function rankAccounts(accts: Account[], style: "avalanche" | "snowball") {
+  const alive = accts.filter((a) => a.balance > 0.00001);
+  const sorted = [...alive].sort((a, b) => {
+    if (style === "avalanche") {
+      // highest APR first, tie-breaker higher balance
+      if (b.apr !== a.apr) return b.apr - a.apr;
+      return b.balance - a.balance;
+    }
+    // snowball: smallest balance first, tie-breaker higher APR
+    if (a.balance !== b.balance) return a.balance - b.balance;
+    return b.apr - a.apr;
+  });
+  return sorted.map((a) => a.id);
+}
+
+function simulatePayoff(
+  accountsInput: Account[],
+  style: "avalanche" | "snowball",
+  extraMonthly: number,
+  options?: { monthsCap?: number; wantMonths?: number }
+): SimResult {
+  const monthsCap = options?.monthsCap ?? 600;
+  const wantMonths = options?.wantMonths ?? 600;
+
+  // Clone working state (balance only changes)
+  const st = accountsInput
     .map((a) => ({
-      id: String(a.id),
-      type: a.type === "loan" ? "loan" : "credit_card",
-      name: String(a.name),
-      apr: Number(a.apr) || 0,
-      balance: Number(a.balance) || 0,
-      minPayment: Number(a.minPayment) || 0,
-      nextDueDay: Number(a.nextDueDay) || 1,
-      creditLimit: a.creditLimit === undefined ? undefined : Number(a.creditLimit) || 0,
-      createdAt: Number(a.createdAt) || Date.now(),
-    }));
-}
-function saveAccounts(email: string, accounts: Account[]) {
-  localStorage.setItem(accountsKey(email), JSON.stringify(accounts));
-}
-function loadSettings(email: string): Settings {
-  const raw = localStorage.getItem(settingsKey(email));
-  const parsed = safeParse<any>(raw, null);
-  if (!parsed || typeof parsed !== "object") {
-    return { amountExtra: 0, method: "avalanche" };
+      ...a,
+      balance: Math.max(0, a.balance),
+      limit: Math.max(0, a.limit),
+      apr: Math.max(0, a.apr),
+      minPay: Math.max(0, a.minPay),
+      dueDate: clamp(a.dueDate || 1, 1, 31),
+    }))
+    .filter((a) => a.balance > 0.00001 || a.minPay > 0);
+
+  const initialOrder = rankAccounts(st, style);
+  let totalInterest = 0;
+  let monthsToPayoff = 0;
+
+  const monthPlans: MonthPlan[] = [];
+
+  const totalDebtNow = () => sum(st.map((a) => a.balance));
+  const allPaid = () => totalDebtNow() <= 0.01;
+
+  // Stall detection: if any month we can’t reduce principal because minimums are <= interest and extra is 0
+  // (This is rare given user can set minimums properly.)
+  let stalled = false;
+
+  for (let m = 1; m <= monthsCap; m++) {
+    if (allPaid()) {
+      monthsToPayoff = m - 1;
+      break;
+    }
+
+    // 1) Accrue interest
+    const interestById: Record<string, number> = {};
+    for (const a of st) {
+      if (a.balance <= 0.01) {
+        interestById[a.id] = 0;
+        continue;
+      }
+      const interest = a.balance * monthlyRate(a.apr);
+      interestById[a.id] = interest;
+      a.balance += interest;
+      totalInterest += interest;
+    }
+
+    // 2) Pay minimums on all active balances
+    const allocations: AllocationRow[] = [];
+    let totalMin = 0;
+    let totalExtra = 0;
+
+    for (const a of st) {
+      if (a.balance <= 0.01) {
+        allocations.push({ accountId: a.id, name: a.name || "Account", min: 0, extra: 0, total: 0 });
+        continue;
+      }
+      const minPay = clamp(a.minPay, 0, a.balance);
+      a.balance -= minPay;
+      totalMin += minPay;
+      allocations.push({ accountId: a.id, name: a.name || "Account", min: minPay, extra: 0, total: minPay });
+    }
+
+    // 3) Allocate extra in priority order; roll leftover into next target in SAME month
+    let extraLeft = Math.max(0, extraMonthly);
+    const order = rankAccounts(st, style);
+
+    // If extra exists but all debts are gone after mins, it stays unused
+    for (const id of order) {
+      if (extraLeft <= 0.00001) break;
+      const a = st.find((x) => x.id === id);
+      if (!a) continue;
+      if (a.balance <= 0.01) continue;
+      const pay = clamp(extraLeft, 0, a.balance);
+      a.balance -= pay;
+      extraLeft -= pay;
+      totalExtra += pay;
+
+      const row = allocations.find((r) => r.accountId === id);
+      if (row) {
+        row.extra += pay;
+        row.total += pay;
+      }
+    }
+
+    // 4) Determine if we’re stalled (no progress possible)
+    // If everyone still has balance, and extraMonthly is 0, and every min is tiny, user must fix mins.
+    if (m === 1) {
+      const hadDebt = accountsInput.some((a) => a.balance > 0.01);
+      const hasProgress = totalMin + totalExtra > 0.00001;
+      if (hadDebt && !hasProgress) stalled = true;
+    }
+
+    // 5) Add month plan (only store up to wantMonths)
+    if (monthPlans.length < wantMonths) {
+      monthPlans.push({
+        monthIndex: m,
+        allocations: allocations
+          .filter((r) => (r.min + r.extra) > 0.00001)
+          .sort((a, b) => (b.total - a.total)),
+        totalMin,
+        totalExtra,
+        totalPaid: totalMin + totalExtra,
+        totalInterest: sum(Object.values(interestById)),
+        remainingDebt: totalDebtNow(),
+      });
+    }
+
+    if (allPaid()) {
+      monthsToPayoff = m;
+      break;
+    }
+
+    if (m === monthsCap) monthsToPayoff = monthsCap;
   }
-  const amountExtra = Number(parsed.amountExtra);
-  const method = parsed.method === "snowball" ? "snowball" : "avalanche";
+
+  // If we never paid off within cap, mark stalled-ish
+  if (!allPaid() && monthsToPayoff === monthsCap) stalled = true;
+
   return {
-    amountExtra: isFinite(amountExtra) ? amountExtra : 0,
-    method,
+    monthsToPayoff,
+    totalInterest,
+    firstTargetIds: initialOrder,
+    monthPlans,
+    stalled,
   };
 }
-function saveSettings(email: string, settings: Settings) {
-  localStorage.setItem(settingsKey(email), JSON.stringify(settings));
+
+// ===== Charts =====
+function UsageColor(pct: number) {
+  if (pct >= 60) return "#d45b5b"; // red
+  if (pct >= 31) return "#d8b24c"; // yellow
+  return "#4a8b57"; // green
 }
 
-// ====== CALC ======
-function projectMinOnly(account: Account, months = 18) {
-  const rows: Array<{
-    month: number;
-    startBal: number;
-    interest: number;
-    minPay: number;
-    endBal: number;
-    util?: number;
-  }> = [];
+function PieChart({
+  title,
+  labels,
+  values,
+}: {
+  title: string;
+  labels: string[];
+  values: number[];
+}) {
+  const total = sum(values.map((v) => Math.max(0, v)));
+  const r = 42;
+  const c = 2 * Math.PI * r;
 
-  let bal = Math.max(0, account.balance);
-  const r = (Math.max(0, account.apr) / 100) / 12;
-  const minPayBase = Math.max(0, account.minPayment);
+  let acc = 0;
+  const slices = values.map((v, i) => {
+    const frac = total > 0 ? Math.max(0, v) / total : 0;
+    const dash = frac * c;
+    const offset = acc * c;
+    acc += frac;
+    return { i, dash, offset, frac };
+  });
 
-  for (let m = 1; m <= months; m++) {
-    if (bal <= 0.0001) break;
-    const start = bal;
-    const interest = start * r;
-    let pay = minPayBase;
-    if (pay > start + interest) pay = start + interest;
-    const end = Math.max(0, start + interest - pay);
+  const palette = [
+    "rgba(70,160,70,0.85)",
+    "rgba(90,140,220,0.85)",
+    "rgba(220,140,90,0.85)",
+    "rgba(170,90,200,0.80)",
+    "rgba(80,180,180,0.85)",
+    "rgba(210,210,90,0.85)",
+  ];
 
-    const util =
-      account.creditLimit && account.creditLimit > 0 ? (end / account.creditLimit) * 100 : undefined;
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      <div style={{ fontWeight: 950 }}>{title}</div>
+      <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap" }}>
+        <svg width="110" height="110" viewBox="0 0 110 110" aria-label={title}>
+          <g transform="translate(55,55) rotate(-90)">
+            <circle r={r} fill="none" stroke="rgba(0,0,0,0.10)" strokeWidth="12" />
+            {slices.map((s) => (
+              <circle
+                key={s.i}
+                r={r}
+                fill="none"
+                stroke={palette[s.i % palette.length]}
+                strokeWidth="12"
+                strokeLinecap="round"
+                strokeDasharray={`${s.dash} ${c - s.dash}`}
+                strokeDashoffset={-s.offset}
+              />
+            ))}
+          </g>
+        </svg>
 
-    rows.push({ month: m, startBal: start, interest, minPay: pay, endBal: end, util });
-    bal = end;
+        <div style={{ display: "grid", gap: 8, minWidth: 220 }}>
+          {labels.length === 0 ? (
+            <div style={{ fontSize: 13, fontWeight: 900, opacity: 0.75 }}>Add accounts to see the chart.</div>
+          ) : (
+            labels.map((lab, i) => (
+              <div key={lab} style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {lab}
+                </div>
+                <div style={{ fontSize: 12, fontWeight: 950 }}>{money(values[i] ?? 0)}</div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UsageBars({
+  rows,
+}: {
+  rows: { name: string; pct: number; balance: number; limit: number }[];
+}) {
+  return (
+    <div style={{ display: "grid", gap: 10 }}>
+      <div style={{ fontWeight: 950 }}>Usage % (balance / limit)</div>
+      {rows.length === 0 ? (
+        <div style={{ fontSize: 13, fontWeight: 900, opacity: 0.75 }}>Add limits to see usage bars.</div>
+      ) : (
+        <div style={{ display: "grid", gap: 14 }}>
+          {rows.map((r) => {
+            const pct = clamp(r.pct, 0, 100);
+            const filled = Math.round(pct / 10); // 0..10 segments
+            const color = UsageColor(pct);
+            return (
+              <div key={r.name} style={{ display: "grid", gap: 8 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <div style={{ fontWeight: 950, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.name}</div>
+                  <div style={{ fontWeight: 950, opacity: 0.85 }}>
+                    {Math.round(pct)}% ({money(r.balance)} / {money(r.limit)})
+                  </div>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(10, 1fr)", gap: 6 }}>
+                  {Array.from({ length: 10 }).map((_, i) => {
+                    const on = i < filled;
+                    return (
+                      <div
+                        key={i}
+                        style={{
+                          height: 14,
+                          borderRadius: 999,
+                          border: "1px solid rgba(0,0,0,0.12)",
+                          background: on ? color : "rgba(255,255,255,0.60)",
+                          boxShadow: on ? "0 6px 16px rgba(0,0,0,0.08)" : "none",
+                        }}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ===== UI =====
+function Card({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        borderRadius: 18,
+        border: "1px solid rgba(0,0,0,0.10)",
+        background: "rgba(255,255,255,0.68)",
+        backdropFilter: "blur(8px)",
+        boxShadow: "0 10px 30px rgba(0,0,0,0.10)",
+        padding: 16,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Button({
+  children,
+  onClick,
+  disabled,
+  variant = "primary",
+  title,
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  variant?: "primary" | "ghost" | "danger";
+  title?: string;
+}) {
+  const base: React.CSSProperties = {
+    padding: "10px 14px",
+    borderRadius: 12,
+    border: "1px solid rgba(0,0,0,0.12)",
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.55 : 1,
+    fontWeight: 900,
+    fontSize: 14,
+    userSelect: "none",
+    transition: "transform 120ms ease, box-shadow 120ms ease",
+    whiteSpace: "nowrap",
+  };
+
+  const styles: Record<string, React.CSSProperties> = {
+    primary: {
+      background: "linear-gradient(135deg, #ffffff 0%, #f7ffd9 100%)",
+      boxShadow: "0 8px 18px rgba(0,0,0,0.10)",
+    },
+    ghost: { background: "rgba(255,255,255,0.55)" },
+    danger: {
+      background: "linear-gradient(135deg, #ffffff 0%, #ffd9d9 100%)",
+      boxShadow: "0 8px 18px rgba(0,0,0,0.10)",
+    },
+  };
+
+  return (
+    <button
+      title={title}
+      disabled={disabled}
+      onClick={disabled ? undefined : onClick}
+      style={{ ...base, ...styles[variant] }}
+      onMouseDown={(e) => {
+        if (disabled) return;
+        (e.currentTarget as HTMLButtonElement).style.transform = "scale(0.99)";
+      }}
+      onMouseUp={(e) => {
+        (e.currentTarget as HTMLButtonElement).style.transform = "scale(1)";
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function Pill({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      style={{
+        display: "inline-block",
+        padding: "6px 10px",
+        borderRadius: 999,
+        fontSize: 12,
+        border: "1px solid rgba(0,0,0,0.12)",
+        background: "rgba(255,255,255,0.60)",
+        backdropFilter: "blur(6px)",
+        fontWeight: 900,
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+function TextField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  inputMode,
+  onBlur,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
+  onBlur?: () => void;
+}) {
+  return (
+    <label style={{ display: "grid", gap: 6 }}>
+      <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>{label}</div>
+      <input
+        value={value}
+        placeholder={placeholder}
+        inputMode={inputMode}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
+        style={{
+          padding: "11px 12px",
+          borderRadius: 12,
+          border: "1px solid rgba(0,0,0,0.16)",
+          background: "rgba(255,255,255,0.78)",
+          outline: "none",
+          fontSize: 14,
+        }}
+      />
+    </label>
+  );
+}
+
+function SelectField({
+  label,
+  value,
+  onChange,
+  options,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+}) {
+  return (
+    <label style={{ display: "grid", gap: 6 }}>
+      <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>{label}</div>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          padding: "11px 12px",
+          borderRadius: 12,
+          border: "1px solid rgba(0,0,0,0.16)",
+          background: "rgba(255,255,255,0.78)",
+          outline: "none",
+          fontSize: 14,
+        }}
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+// ===== Page =====
+export default function Page() {
+  const [hydrated, setHydrated] = useState(false);
+
+  // optional supabase status (informational)
+  const [supabaseConnected, setSupabaseConnected] = useState(false);
+
+  // auth
+  const [session, setSession] = useState<Session | null>(null);
+  const [authMode, setAuthMode] = useState<"signin" | "create">("signin");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [selectedPlan, setSelectedPlan] = useState<Exclude<Plan, "guest">>("basic");
+  const [promoCode, setPromoCode] = useState("");
+  const [statusMsg, setStatusMsg] = useState("");
+
+  // app
+  const [tab, setTab] = useState<"dashboard" | "accounts" | "plan" | "profile">("dashboard");
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [settings, setSettings] = useState<Settings>({
+    payoffStyle: "avalanche",
+    extraMonthly: 0,
+    lastUpdatedAt: Date.now(),
+  });
+
+  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
+  const [expanded6, setExpanded6] = useState(false);
+
+  // Draft inputs per-account (fixes dot typing + no leading zeros/spinners)
+  const [draft, setDraft] = useState<Record<string, Record<string, string>>>({});
+
+  const plan: Plan = session?.plan ?? "guest";
+  const emailNorm = session?.email ? normalizeEmail(session.email) : "";
+  const accountsKey = emailNorm ? `${KEY_ACCOUNTS_PREFIX}${emailNorm}` : "";
+  const settingsKey = emailNorm ? `${KEY_SETTINGS_PREFIX}${emailNorm}` : "";
+
+  const users = hydrated ? (lsGet<UserRec[]>(KEY_USERS) ?? []) : [];
+  const currentUser = useMemo(() => {
+    if (!emailNorm) return null;
+    return users.find((u) => normalizeEmail(u.email) === emailNorm) ?? null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, emailNorm]);
+
+  const displayName = (currentUser?.displayName?.trim() || emailNorm || "Guest").toLowerCase();
+
+  const pageStyle: React.CSSProperties = {
+    minHeight: "100vh",
+    background:
+      "radial-gradient(1100px 700px at 15% 10%, rgba(255,255,255,0.75), rgba(255,255,255,0) 60%)," +
+      "radial-gradient(900px 600px at 85% 15%, rgba(255,205,205,0.35), rgba(255,255,255,0) 60%)," +
+      "radial-gradient(900px 600px at 25% 80%, rgba(198,255,221,0.35), rgba(255,255,255,0) 55%)," +
+      "radial-gradient(900px 600px at 85% 80%, rgba(198,210,255,0.35), rgba(255,255,255,0) 55%)," +
+      "linear-gradient(180deg, #c8d2b8 0%, #dde6cf 40%, #eef3e6 100%)",
+    color: "#1b1b1b",
+  };
+
+  function saveAccounts(next: Account[]) {
+    setAccounts(next);
+    if (plan === "guest") return;
+    lsSet(accountsKey, next);
   }
-  return rows;
-}
 
-function buildPayoffPlan(accounts: Account[], amountExtra: number, method: "avalanche" | "snowball") {
-  // Work with mutable balances
-  const work = accounts.map((a) => ({ ...a, workBal: Math.max(0, a.balance) }));
-  const rOf = (apr: number) => (Math.max(0, apr) / 100) / 12;
+  function saveSettings(next: Settings) {
+    const s = { ...next, lastUpdatedAt: Date.now() };
+    setSettings(s);
+    if (plan === "guest") return;
+    lsSet(settingsKey, s);
+  }
 
-  const minTotal = work.reduce((s, a) => s + Math.max(0, a.minPayment), 0);
-  const extra = Math.max(0, amountExtra);
+  function upsertDraft(id: string, key: string, value: string) {
+    setDraft((prev) => ({
+      ...prev,
+      [id]: { ...(prev[id] ?? {}), [key]: value },
+    }));
+  }
 
-  const months: Array<{
-    month: number;
-    interestTotal: number;
-    minTotal: number;
-    extraBudget: number;
-    extraSpent: number;
-    totalPaid: number;
-    extraByAccount: Array<{ id: string; name: string; extra: number }>;
-    balances: Array<{ id: string; name: string; bal: number }>;
-  }> = [];
+  function getDraft(id: string, key: string, fallback: string) {
+    return draft[id]?.[key] ?? fallback;
+  }
 
-  for (let m = 1; m <= 24; m++) {
-    if (work.every((a) => a.workBal <= 0.0001)) break;
-
-    // interest accrues
-    let interestTotal = 0;
-    for (const a of work) {
-      if (a.workBal <= 0.0001) continue;
-      const interest = a.workBal * rOf(a.apr);
-      a.workBal += interest;
-      interestTotal += interest;
-    }
-
-    // pay minimums
-    for (const a of work) {
-      if (a.workBal <= 0.0001) continue;
-      const pay = Math.min(a.workBal, Math.max(0, a.minPayment));
-      a.workBal -= pay;
-    }
-
-    // choose target order
-    const alive = work.filter((a) => a.workBal > 0.0001);
-    const ordered =
-      method === "avalanche"
-        ? alive.sort((x, y) => (y.apr - x.apr) || (y.workBal - x.workBal))
-        : alive.sort((x, y) => (x.workBal - y.workBal) || (y.apr - x.apr));
-
-    // apply extra to targets
-    let remaining = extra;
-    const extraByAccount: Array<{ id: string; name: string; extra: number }> = [];
-
-    for (const t of ordered) {
-      if (remaining <= 0.0001) break;
-      const spend = Math.min(remaining, t.workBal);
-      t.workBal -= spend;
-      remaining -= spend;
-      extraByAccount.push({ id: t.id, name: t.name, extra: spend });
-    }
-
-    const extraSpent = extra - remaining;
-    const totalPaid = minTotal + extraSpent;
-
-    months.push({
-      month: m,
-      interestTotal,
-      minTotal,
-      extraBudget: extra,
-      extraSpent,
-      totalPaid,
-      extraByAccount,
-      balances: work.map((a) => ({ id: a.id, name: a.name, bal: Math.max(0, a.workBal) })),
+  function clearDraft(id: string, key: string) {
+    setDraft((prev) => {
+      const next = { ...prev };
+      if (!next[id]) return prev;
+      const row = { ...next[id] };
+      delete row[key];
+      next[id] = row;
+      return next;
     });
   }
 
-  return { minTotal, months };
-}
-
-// ====== UI COMPONENTS (INLINE) ======
-function LogoMark() {
-  // Minimal “path/arrow” icon
-  return (
-    <svg width="34" height="34" viewBox="0 0 64 64" aria-hidden="true">
-      <defs>
-        <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0" stopColor="rgba(47,111,78,0.95)" />
-          <stop offset="1" stopColor="rgba(125,187,149,0.95)" />
-        </linearGradient>
-      </defs>
-      <rect x="6" y="6" width="52" height="52" rx="18" fill="rgba(255,255,255,0.65)" stroke="rgba(20,40,26,0.18)" />
-      <path
-        d="M18 40c10-18 16-20 28-14"
-        stroke="url(#g)"
-        strokeWidth="6"
-        strokeLinecap="round"
-        fill="none"
-      />
-      <path
-        d="M43 18l8 8-12 2"
-        fill="url(#g)"
-      />
-    </svg>
-  );
-}
-
-function Modal({
-  open,
-  title,
-  children,
-  onClose,
-}: {
-  open: boolean;
-  title: string;
-  children: React.ReactNode;
-  onClose: () => void;
-}) {
-  if (!open) return null;
-  return (
-    <div className="modalOverlay" onMouseDown={onClose}>
-      <div className="modal" onMouseDown={(e) => e.stopPropagation()}>
-        <div className="row" style={{ alignItems: "flex-start" }}>
-          <div>
-            <div style={{ fontWeight: 900, fontSize: 16 }}>{title}</div>
-          </div>
-          <button className="btn" onClick={onClose}>
-            Close
-          </button>
-        </div>
-        <div className="hr" />
-        {children}
-      </div>
-    </div>
-  );
-}
-
-function AdBanner({ variant, onUpgrade }: { variant: "full" | "compact"; onUpgrade?: () => void }) {
-  return (
-    <div className="adDock">
-      <div className={`ad ${variant === "compact" ? "compact" : ""}`}>
-        <div>
-          <div className="tag">SPONSORED</div>
-          <div className="copy">
-            {variant === "compact"
-              ? "Tip: keep utilization under 30% if you can."
-              : "Quick tip: paying earlier in the cycle can lower your reported utilization."}
-          </div>
-        </div>
-        {onUpgrade ? (
-          <button className="btn primary" onClick={onUpgrade}>
-            Explore Pro
-          </button>
-        ) : (
-          <button className="btn">Learn more</button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ====== MAIN ======
-export default function Page() {
-  // auth state
-  const [session, setSession] = useState<Session | null>(null);
-  const [authMode, setAuthMode] = useState<AuthMode>("signin");
-  const [planPick, setPlanPick] = useState<Plan>("basic");
-  const [authEmail, setAuthEmail] = useState("");
-  const [authPassword, setAuthPassword] = useState("");
-  const [authMsg, setAuthMsg] = useState<{ type: "good" | "bad"; text: string } | null>(null);
-
-  // app state
-  const [tab, setTab] = useState<Tab>("accounts");
-  const [accounts, setAccounts] = useState<Account[]>([]);
-  const [settings, setSettings] = useState<Settings>({ amountExtra: 0, method: "avalanche" });
-
-  // editor
-  const [editorOpen, setEditorOpen] = useState(false);
-  const [editId, setEditId] = useState<string | null>(null);
-  const [form, setForm] = useState({
-    type: "credit_card" as AccountType,
-    name: "",
-    apr: "",
-    balance: "",
-    minPayment: "",
-    nextDueDay: "1",
-    creditLimit: "",
-  });
-  const [toast, setToast] = useState<{ type: "good" | "bad"; text: string } | null>(null);
-
-  // details view (Pro-only)
-  const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
-  const [lockedOpen, setLockedOpen] = useState(false);
-
-  // profile
-  const [profileName, setProfileName] = useState("");
-  const [profileShowPw, setProfileShowPw] = useState(false);
-  const [profileNewPw, setProfileNewPw] = useState("");
-  const [profileMsg, setProfileMsg] = useState<{ type: "good" | "bad"; text: string } | null>(null);
-
-  // load session once
-  useEffect(() => {
-    const s = loadSession();
-    if (s) setSession(s);
-  }, []);
-
-  // load accounts/settings when session changes
-  useEffect(() => {
-    if (!session) return;
-    if (session.isGuest) {
-      setAccounts([]);
-      setSettings({ amountExtra: 0, method: "avalanche" });
-      setProfileName(session.name || "Guest");
-      return;
-    }
-    const a = loadAccounts(session.email);
-    setAccounts(a);
-    const st = loadSettings(session.email);
-    setSettings(st);
-    setProfileName(session.name || session.email);
-  }, [session?.email, session?.isGuest]);
-
-  const isMaster = session?.email === MASTER_EMAIL;
-  const isPro = !!session && !session.isGuest && (session.plan === "pro" || isMaster);
-
-  // reduced ads for pro: only show on Plan or Profile (compact)
-  const showAds = useMemo(() => {
-    if (!session) return false;
-    if (session.isGuest) return true; // guest sees ads
-    if (isPro) return tab === "plan" || tab === "profile";
-    return true; // basic sees ads on all tabs
-  }, [session, tab, isPro]);
-
-  const adVariant: "full" | "compact" = isPro ? "compact" : "full";
-
-  // payoff plan
-  const payoff = useMemo(() => {
-    const extra = Math.max(0, settings.amountExtra || 0);
-    return buildPayoffPlan(accounts, extra, settings.method);
-  }, [accounts, settings.amountExtra, settings.method]);
-
-  const totalBalance = useMemo(() => accounts.reduce((s, a) => s + Math.max(0, a.balance), 0), [accounts]);
-  const totalMin = useMemo(() => accounts.reduce((s, a) => s + Math.max(0, a.minPayment), 0), [accounts]);
-
-  // details account
-  const selectedAccount = useMemo(
-    () => accounts.find((a) => a.id === selectedAccountId) || null,
-    [accounts, selectedAccountId]
-  );
-  const detailsRows = useMemo(() => (selectedAccount ? projectMinOnly(selectedAccount, 18) : []), [selectedAccount]);
-
-  // ====== AUTH ACTIONS ======
-  function signOut() {
-    saveSession(null);
-    setSession(null);
-    setAuthEmail("");
-    setAuthPassword("");
-    setAuthMsg(null);
-    setTab("accounts");
-    setSelectedAccountId(null);
-  }
-
-  function continueAsGuest() {
-    const guest: Session = {
-      email: "guest",
-      plan: "basic",
-      name: "Guest",
-      isGuest: true,
-    };
-    saveSession(guest);
-    setSession(guest);
-    setAuthMsg(null);
-    setTab("accounts");
-  }
-
-  function handleAuthSubmit(e: React.FormEvent) {
-    e.preventDefault();
+  // ===== auth operations =====
+  async function createUser() {
+    setStatusMsg("");
     const email = normalizeEmail(authEmail);
     const pw = authPassword;
 
-    if (!email || !pw) {
-      setAuthMsg({ type: "bad", text: "Email and password are required." });
+    if (!email.includes("@")) return setStatusMsg("Enter a valid email.");
+    if (!isStrongEnough(pw)) return setStatusMsg("Password must be at least 8 characters.");
+
+    const usersNow = lsGet<UserRec[]>(KEY_USERS) ?? [];
+    if (usersNow.some((u) => normalizeEmail(u.email) === email)) {
+      setStatusMsg("Account already exists. Switch to Sign in.");
       return;
     }
 
-    const users = loadUsers();
-    const existing = users.find((u) => u.email === email);
+    const salt = randomSalt(16);
+    const hash = await hashPassword(pw, salt);
 
-    if (authMode === "signup") {
-      if (planPick === "pro") {
-        // Pro coming soon: block create
-        setAuthMsg({ type: "bad", text: "Pro is coming soon. Choose Basic to create an account today." });
-        return;
-      }
-      if (existing) {
-        setAuthMsg({ type: "bad", text: "That account already exists. Please sign in." });
-        setAuthMode("signin");
-        return;
-      }
-      const newUser: User = {
-        email,
-        password: pw,
-        plan: "basic",
-        name: email, // default name = email
-      };
-      saveUsers([...users, newUser]);
-      setAuthMsg({ type: "good", text: "Account created. Now sign in." });
-      setAuthMode("signin");
-      return;
-    }
+    const promoValid = promoCode.trim() !== "" && promoCode.trim() === PROMO_CODE_PRO;
+    const basePlan: Exclude<Plan, "guest"> = selectedPlan === "pro" ? "basic" : selectedPlan; // pro not selectable directly
+    const finalPlan = computePlanFromEmail(email, promoValid ? "pro" : basePlan);
 
-    // signin
-    if (!existing) {
-      setAuthMsg({ type: "bad", text: "No account found. Create one first." });
-      return;
-    }
-    if (existing.password !== pw) {
-      setAuthMsg({ type: "bad", text: "Wrong password." });
-      return;
-    }
-
-    const sess: Session = {
+    const rec: UserRec = {
       email,
-      plan: existing.plan,
-      name: existing.name || email,
-      isGuest: false,
+      createdAt: Date.now(),
+      plan: finalPlan,
+      passwordSalt: salt,
+      passwordHash: hash,
+      displayName: undefined,
     };
-    saveSession(sess);
-    setSession(sess);
-    setAuthMsg(null);
-    setTab("accounts");
+
+    usersNow.push(rec);
+    lsSet(KEY_USERS, usersNow);
+
+    const s: Session = { email, plan: finalPlan };
+    lsSet(KEY_SESSION, s);
+    setSession(s);
+
+    // init settings if missing
+    const existingSettings = lsGet<Settings>(`${KEY_SETTINGS_PREFIX}${email}`);
+    if (!existingSettings) {
+      lsSet(`${KEY_SETTINGS_PREFIX}${email}`, {
+        payoffStyle: "avalanche",
+        extraMonthly: 0,
+        lastUpdatedAt: Date.now(),
+      } satisfies Settings);
+    }
+
+    setTab("dashboard");
+    setStatusMsg("Signed in.");
   }
 
-  // ====== ACCOUNT EDITOR ======
-  function openAdd() {
-    if (!session || session.isGuest) {
-      setToast({ type: "bad", text: "Guest mode doesn’t save. Create an account to save your data." });
+  async function signInUser() {
+    setStatusMsg("");
+    const email = normalizeEmail(authEmail);
+    const pw = authPassword;
+
+    if (!email.includes("@")) return setStatusMsg("Enter a valid email.");
+    if (pw.length === 0) return setStatusMsg("Enter your password.");
+
+    const usersNow = lsGet<UserRec[]>(KEY_USERS) ?? [];
+    const u = usersNow.find((x) => normalizeEmail(x.email) === email);
+    if (!u) return setStatusMsg("No account found. Switch to Create account.");
+
+    const hash = await hashPassword(pw, u.passwordSalt);
+    if (hash !== u.passwordHash) return setStatusMsg("Wrong password.");
+
+    // allow promo on sign-in (guest typed it) to upgrade
+    const promoValid = promoCode.trim() !== "" && promoCode.trim() === PROMO_CODE_PRO;
+    let nextPlan = computePlanFromEmail(email, u.plan);
+
+    if (promoValid && !isMaster(email) && nextPlan !== "pro") {
+      // upgrade
+      u.plan = "pro";
+      nextPlan = "pro";
+      lsSet(KEY_USERS, usersNow);
+    }
+
+    const s: Session = { email, plan: nextPlan };
+    lsSet(KEY_SESSION, s);
+    setSession(s);
+    setTab("dashboard");
+    setStatusMsg("Signed in.");
+  }
+
+  function signOut() {
+    lsDel(KEY_SESSION);
+    setSession(null);
+    setSelectedAccountId(null);
+    setExpanded6(false);
+    setStatusMsg("Signed out.");
+  }
+
+  async function forgotPassword() {
+    setStatusMsg("");
+    const email = normalizeEmail(authEmail);
+    if (!email.includes("@")) return setStatusMsg("Type your email first.");
+
+    // Try Supabase reset if configured
+    try {
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: `${window.location.origin}/`,
+      });
+      if (!error) {
+        setStatusMsg("Reset email sent (if Supabase is configured). Check your inbox.");
+        return;
+      }
+    } catch {
+      // ignore
+    }
+
+    // Local reset fallback (deletes local data)
+    const usersNow = lsGet<UserRec[]>(KEY_USERS) ?? [];
+    const filtered = usersNow.filter((u) => normalizeEmail(u.email) !== email);
+    lsSet(KEY_USERS, filtered);
+    lsDel(`${KEY_ACCOUNTS_PREFIX}${email}`);
+    lsDel(`${KEY_SETTINGS_PREFIX}${email}`);
+    lsDel(KEY_SESSION);
+    setSession(null);
+    setStatusMsg("Local reset complete. Create the account again.");
+  }
+
+  // ===== init / hydration =====
+  useEffect(() => {
+    setHydrated(true);
+
+    const s = lsGet<Session>(KEY_SESSION);
+    if (s?.email) {
+      const fixed: Session = {
+        email: normalizeEmail(s.email),
+        plan: computePlanFromEmail(s.email, s.plan),
+      };
+      setSession(fixed);
+    }
+
+    // supabase informational check
+    (async () => {
+      try {
+        const { data, error } = await supabase.auth.getSession();
+        if (error) return setSupabaseConnected(false);
+        setSupabaseConnected(!!data?.session);
+      } catch {
+        setSupabaseConnected(false);
+      }
+    })();
+  }, []);
+
+  // load per-user data
+  useEffect(() => {
+    if (!hydrated) return;
+
+    if (!emailNorm) {
+      setAccounts([]);
+      setSettings({ payoffStyle: "avalanche", extraMonthly: 0, lastUpdatedAt: Date.now() });
       return;
     }
-    setEditId(null);
-    setForm({
-      type: "credit_card",
+
+    const a = lsGet<Account[]>(accountsKey);
+    setAccounts(Array.isArray(a) ? a : []);
+
+    const st = lsGet<Settings>(settingsKey);
+    if (st) setSettings(st);
+  }, [hydrated, emailNorm]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ===== derived numbers =====
+  const totals = useMemo(() => {
+    const totalDebt = sum(accounts.map((a) => Math.max(0, a.balance)));
+    const totalMin = sum(accounts.map((a) => Math.max(0, a.minPay)));
+    const interestThisMonth = sum(accounts.map((a) => Math.max(0, a.balance) * monthlyRate(a.apr)));
+    return { totalDebt, totalMin, interestThisMonth };
+  }, [accounts]);
+
+  const usageRows = useMemo(() => {
+    const rows = accounts
+      .filter((a) => a.limit > 0.01)
+      .map((a) => {
+        const pct = (a.balance / a.limit) * 100;
+        return {
+          name: a.name?.trim() || "Account",
+          pct: Number.isFinite(pct) ? pct : 0,
+          balance: a.balance,
+          limit: a.limit,
+        };
+      })
+      .sort((a, b) => b.pct - a.pct);
+    return rows;
+  }, [accounts]);
+
+  const pieData = useMemo(() => {
+    const labels = accounts.map((a) => a.name?.trim() || "Account");
+    const values = accounts.map((a) => Math.max(0, a.balance));
+    return { labels, values };
+  }, [accounts]);
+
+  const planSimAvalanche = useMemo(() => {
+    const extra = Math.max(0, settings.extraMonthly);
+    return simulatePayoff(accounts, "avalanche", extra, { monthsCap: 600, wantMonths: expanded6 ? 6 : 1 });
+  }, [accounts, settings.extraMonthly, expanded6]);
+
+  const planSimSnowball = useMemo(() => {
+    const extra = Math.max(0, settings.extraMonthly);
+    return simulatePayoff(accounts, "snowball", extra, { monthsCap: 600, wantMonths: expanded6 ? 6 : 1 });
+  }, [accounts, settings.extraMonthly, expanded6]);
+
+  const chosenSim = settings.payoffStyle === "avalanche" ? planSimAvalanche : planSimSnowball;
+
+  const thisMonthPlan = chosenSim.monthPlans[0];
+  const nextMonthsPlans = chosenSim.monthPlans.slice(0, expanded6 ? 6 : 1);
+
+  // ===== account ops =====
+  function addAccount() {
+    const a: Account = {
+      id: uid(),
       name: "",
-      apr: "",
-      balance: "",
-      minPayment: "",
-      nextDueDay: "1",
-      creditLimit: "",
-    });
-    setEditorOpen(true);
-  }
-
-  function openEdit(account: Account) {
-    if (!session || session.isGuest) {
-      setToast({ type: "bad", text: "Guest mode doesn’t save. Create an account to save your data." });
-      return;
-    }
-    setEditId(account.id);
-    setForm({
-      type: account.type,
-      name: account.name,
-      apr: String(account.apr),
-      balance: String(account.balance),
-      minPayment: String(account.minPayment),
-      nextDueDay: String(account.nextDueDay),
-      creditLimit: account.creditLimit !== undefined ? String(account.creditLimit) : "",
-    });
-    setEditorOpen(true);
-  }
-
-  function saveAccount() {
-    if (!session || session.isGuest) return;
-
-    const name = capWords(form.name);
-    const apr = Number(form.apr);
-    const balance = Number(form.balance);
-    const minPayment = Number(form.minPayment);
-    const nextDueDay = Number(form.nextDueDay);
-    const creditLimit = form.creditLimit.trim() === "" ? undefined : Number(form.creditLimit);
-
-    if (!name || !isFinite(apr) || !isFinite(balance) || !isFinite(minPayment) || !isFinite(nextDueDay)) {
-      setToast({ type: "bad", text: "Missing or invalid fields. Please fill everything required." });
-      return;
-    }
-    if (nextDueDay < 1 || nextDueDay > 31) {
-      setToast({ type: "bad", text: "Next due date must be 1–31." });
-      return;
-    }
-    if (form.type === "credit_card" && creditLimit !== undefined && creditLimit > 0 && balance > creditLimit) {
-      setToast({ type: "bad", text: "Balance is higher than limit. You can save it, but consider checking the numbers." });
-      // allow save anyway
-    }
-
-    const updated: Account = {
-      id: editId || uid(),
-      type: form.type,
-      name,
-      apr: Math.max(0, apr),
-      balance: Math.max(0, balance),
-      minPayment: Math.max(0, minPayment),
-      nextDueDay,
-      creditLimit: creditLimit !== undefined ? Math.max(0, creditLimit) : undefined,
-      createdAt: editId ? (accounts.find(a => a.id === editId)?.createdAt ?? Date.now()) : Date.now(),
+      type: "Credit Card",
+      balance: 0,
+      limit: 0,
+      apr: 0,
+      minPay: 0,
+      dueDate: 1,
+      notes: "",
+      createdAt: Date.now(),
     };
+    saveAccounts([a, ...accounts]);
+    setSelectedAccountId(a.id);
+  }
 
-    const next = editId ? accounts.map((a) => (a.id === editId ? updated : a)) : [updated, ...accounts];
-
-    setAccounts(next);
-    saveAccounts(session.email, next);
-    setEditorOpen(false);
-    setToast({ type: "good", text: "Account information added." });
+  function updateAccount(id: string, patch: Partial<Account>) {
+    const next = accounts.map((a) => (a.id === id ? { ...a, ...patch } : a));
+    saveAccounts(next);
   }
 
   function deleteAccount(id: string) {
-    if (!session || session.isGuest) return;
     const next = accounts.filter((a) => a.id !== id);
-    setAccounts(next);
-    saveAccounts(session.email, next);
+    saveAccounts(next);
     if (selectedAccountId === id) setSelectedAccountId(null);
-    setToast({ type: "good", text: "Account removed." });
   }
 
-  function handleAccountClick(account: Account) {
-    if (!isPro) {
-      setLockedOpen(true);
-      return;
-    }
-    setSelectedAccountId(account.id);
-  }
+  const selectedAccount = accounts.find((a) => a.id === selectedAccountId) ?? null;
 
-  // ====== SETTINGS ======
-  function updateSettings(next: Settings) {
-    setSettings(next);
-    if (session && !session.isGuest) saveSettings(session.email, next);
-  }
-
-  // ====== PROFILE ======
-  function saveProfile() {
-    if (!session) return;
-    if (session.isGuest) {
-      setProfileMsg({ type: "bad", text: "Guest mode can’t save a profile. Create an account." });
-      return;
-    }
-
-    const users = loadUsers();
-    const email = session.email;
-    const me = users.find((u) => u.email === email);
-    if (!me) {
-      setProfileMsg({ type: "bad", text: "Account not found in storage. Create an account again." });
-      return;
-    }
-
-    const newName = (profileName || email).trim();
-    let newPw = me.password;
-    if (profileNewPw.trim()) newPw = profileNewPw;
-
-    const updatedUsers = users.map((u) =>
-      u.email === email ? { ...u, name: newName, password: newPw } : u
-    );
-    saveUsers(updatedUsers);
-
-    const nextSession = { ...session, name: newName };
-    saveSession(nextSession);
-    setSession(nextSession);
-
-    setProfileNewPw("");
-    setProfileMsg({ type: "good", text: "Profile updated." });
-  }
-
-  // ====== LOGIN SCREEN ======
-  if (!session) {
-    const proSelected = planPick === "pro";
+  // ===== UI pieces =====
+  function Header() {
+    const signedName = plan === "guest" ? "Guest" : (currentUser?.displayName?.trim() || "Signed in");
     return (
-      <>
-        <BackgroundArt />
-        <div className="app">
-          <div className="topbar">
-            <div className="brand">
-              <LogoMark />
-              <div>
-                <div className="brand-name">{APP_NAME}</div>
-                <div className="brand-sub">Clear, calm payoff planning</div>
-              </div>
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "22px 16px 8px" }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div
+              aria-label="logo"
+              style={{
+                width: 42,
+                height: 42,
+                borderRadius: 14,
+                background: "rgba(255,255,255,0.75)",
+                border: "1px solid rgba(0,0,0,0.10)",
+                display: "grid",
+                placeItems: "center",
+                fontWeight: 1000,
+              }}
+            >
+              CP
             </div>
-            <div className="row" style={{ justifyContent: "flex-end", gap: 10 }}>
-              <button className="btn" onClick={() => continueAsGuest()}>
-                Continue as guest
-              </button>
+            <div style={{ display: "grid", gap: 2 }}>
+              <div style={{ fontSize: 22, fontWeight: 1000, letterSpacing: -0.3 }}>{APP_NAME}</div>
+              <div style={{ fontSize: 13, fontWeight: 900, opacity: 0.75 }}>{TAGLINE}</div>
             </div>
           </div>
 
-          <div className="grid">
-            <div className="card">
-              <h2>{authMode === "signin" ? "Sign in" : "Create account"}</h2>
-              <div className="muted" style={{ marginBottom: 10 }}>
-                Guest mode lets you try the app, but it won’t save anything.
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+            <Pill>Plan: {plan === "guest" ? "Guest" : session?.plan === "pro" ? "Pro" : "Basic"}</Pill>
+            <Pill>Supabase: {supabaseConnected ? "connected" : "not connected"}</Pill>
+            <Pill>{signedName}</Pill>
+            {plan === "guest" ? (
+              <Button variant="ghost" onClick={() => setTab("profile")}>
+                Sign in
+              </Button>
+            ) : (
+              <Button variant="ghost" onClick={signOut}>
+                Sign out
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function GuestBanner() {
+    if (plan !== "guest") return null;
+    return (
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "10px 16px 0" }}>
+        <div
+          style={{
+            borderRadius: 18,
+            padding: 14,
+            border: "1px solid rgba(0,0,0,0.12)",
+            background: "linear-gradient(135deg, rgba(255,255,255,0.75), rgba(245,255,205,0.55))",
+            boxShadow: "0 10px 24px rgba(0,0,0,0.08)",
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            gap: 12,
+            flexWrap: "wrap",
+          }}
+        >
+          <div style={{ display: "grid", gap: 6 }}>
+            <div style={{ fontWeight: 1000 }}>Guest mode: explore freely — nothing saves yet.</div>
+            <div style={{ fontWeight: 900, opacity: 0.75, fontSize: 13 }}>
+              Create Basic to save locally. Promo unlocks Pro.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+            <Button onClick={() => { setAuthMode("create"); setSelectedPlan("basic"); setTab("profile"); }}>
+              Create Basic
+            </Button>
+            <Button variant="ghost" onClick={() => { setAuthMode("signin"); setTab("profile"); }}>
+              Sign in
+            </Button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function Tabs() {
+    const tabs: { key: typeof tab; label: string }[] = [
+      { key: "dashboard", label: "Dashboard" },
+      { key: "accounts", label: "Accounts" },
+      { key: "plan", label: "Plan" },
+      { key: "profile", label: "Profile" },
+    ];
+    return (
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 16px 0" }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {tabs.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              style={{
+                padding: "10px 14px",
+                borderRadius: 12,
+                border: "1px solid rgba(0,0,0,0.12)",
+                background: tab === t.key ? "rgba(255,255,255,0.78)" : "rgba(255,255,255,0.55)",
+                fontWeight: 1000,
+                cursor: "pointer",
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  function Dashboard() {
+    const hello = plan === "guest" ? "Hello" : `Hello, ${currentUser?.displayName?.trim() || emailNorm}`;
+    return (
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 16px 28px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14, alignItems: "start" }}>
+          <Card>
+            <div style={{ display: "grid", gap: 10 }}>
+              <div>
+                <div style={{ fontSize: 22, fontWeight: 1000 }}>{hello}</div>
+                <div style={{ fontSize: 13, fontWeight: 900, opacity: 0.75 }}>
+                  Your payoff scoreboard — fast to read, built to push action.
+                </div>
               </div>
 
-              <form onSubmit={handleAuthSubmit}>
-                <div className="formgrid">
-                  <div>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Email
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <Pill>Total debt: {money(totals.totalDebt)}</Pill>
+                <Pill>Total min pay: {money(totals.totalMin)}</Pill>
+                <Pill>Interest/mo: {money(totals.interestThisMonth)}</Pill>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <Card>
+                  <PieChart title="Balances" labels={pieData.labels} values={pieData.values} />
+                </Card>
+                <Card>
+                  <UsageBars rows={usageRows} />
+                </Card>
+              </div>
+
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <Button onClick={() => { setTab("accounts"); addAccount(); }}>+ Add account</Button>
+                <Button variant="ghost" onClick={() => setTab("accounts")}>View accounts</Button>
+                <Button variant="ghost" onClick={() => setTab("plan")}>View plan</Button>
+              </div>
+            </div>
+          </Card>
+
+          <div style={{ display: "grid", gap: 14 }}>
+            <Card>
+              <div style={{ display: "grid", gap: 10 }}>
+                <div style={{ fontWeight: 1000, fontSize: 16 }}>Pro insight: snapshot</div>
+                <div style={{ fontWeight: 900, opacity: 0.8 }}>
+                  {money(totals.interestThisMonth)} interest / {money(totals.totalMin)} minimums
+                </div>
+                <div style={{ fontWeight: 900, opacity: 0.8 }}>Total debt: {money(totals.totalDebt)}</div>
+                <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.7 }}>
+                  This uses all accounts (not one).
+                </div>
+              </div>
+            </Card>
+
+            <Card>
+              <div style={{ fontWeight: 1000, fontSize: 16, marginBottom: 10 }}>Quick totals</div>
+              <div style={{ display: "grid", gap: 6, fontWeight: 900, opacity: 0.85 }}>
+                <div>Total debt: {money(totals.totalDebt)}</div>
+                <div>Total min pay: {money(totals.totalMin)}</div>
+                <div>Interest/mo: {money(totals.interestThisMonth)}</div>
+              </div>
+            </Card>
+
+            <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.6, paddingLeft: 4 }}>
+              Demo build • Local storage • Supabase reset optional
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function Accounts() {
+    return (
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 16px 28px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ fontSize: 18, fontWeight: 1000 }}>Accounts</div>
+          <Button onClick={addAccount}>+ Add account</Button>
+        </div>
+
+        <div style={{ height: 12 }} />
+
+        <div style={{ display: "grid", gap: 12 }}>
+          {accounts.length === 0 && (
+            <Card>
+              <div style={{ fontWeight: 900, opacity: 0.75 }}>No accounts yet. Add one to start building your plan.</div>
+            </Card>
+          )}
+
+          {accounts.map((a) => {
+            const isOpen = selectedAccountId === a.id;
+
+            // derived
+            const usagePct = a.limit > 0 ? clamp((a.balance / a.limit) * 100, 0, 999) : 0;
+
+            // per-account schedule (minimum only)
+            const minOnly = simulatePayoff([a], "avalanche", 0, { monthsCap: 600, wantMonths: 12 });
+            const stalled = minOnly.stalled && a.balance > 0.01 && a.minPay <= 0;
+
+            return (
+              <Card key={a.id}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                      <div style={{ fontSize: 16, fontWeight: 1000 }}>{a.name?.trim() || "Unnamed account"}</div>
+                      <Pill>{a.type}</Pill>
+                      <Pill>Due date {ordinal(clamp(a.dueDate || 1, 1, 31))}</Pill>
+                      {a.limit > 0 && <Pill>Usage {Math.round(usagePct)}%</Pill>}
                     </div>
-                    <input
-                      className="input"
-                      value={authEmail}
-                      onChange={(e) => setAuthEmail(e.target.value)}
-                      placeholder="you@email.com"
-                      autoComplete="email"
-                    />
+                    <div style={{ fontWeight: 900, opacity: 0.78, fontSize: 13 }}>
+                      Balance {money(a.balance)} • Limit {money(a.limit)} • APR {a.apr.toFixed(2)}% • Min {money(a.minPay)}/mo
+                    </div>
                   </div>
-                  <div>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Password
-                    </div>
-                    <input
-                      className="input"
-                      type="password"
-                      value={authPassword}
-                      onChange={(e) => setAuthPassword(e.target.value)}
-                      placeholder="••••••••"
-                      autoComplete={authMode === "signin" ? "current-password" : "new-password"}
-                    />
+
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Button variant="ghost" onClick={() => setSelectedAccountId(isOpen ? null : a.id)}>
+                      {isOpen ? "Close" : "Open"}
+                    </Button>
+                    <Button variant="danger" onClick={() => deleteAccount(a.id)}>
+                      Delete
+                    </Button>
                   </div>
                 </div>
 
-                {authMode === "signup" && (
-                  <div style={{ marginTop: 12 }}>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Choose plan
-                    </div>
-                    <select
-                      className="select"
-                      value={planPick}
-                      onChange={(e) => setPlanPick(e.target.value as Plan)}
-                    >
-                      <option value="basic">Basic (free)</option>
-                      <option value="pro">Pro (coming soon)</option>
-                    </select>
+                {isOpen && (
+                  <div style={{ marginTop: 14, display: "grid", gap: 14 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1fr", gap: 12 }}>
+                      <TextField
+                        label="Name"
+                        value={getDraft(a.id, "name", a.name || "")}
+                        onChange={(v) => upsertDraft(a.id, "name", v)}
+                        onBlur={() => {
+                          updateAccount(a.id, { name: getDraft(a.id, "name", a.name || "").trim() });
+                          clearDraft(a.id, "name");
+                        }}
+                        placeholder="e.g., CHASE"
+                      />
 
-                    {planPick === "pro" && (
-                      <div style={{ marginTop: 12 }} className="banner">
-                        <h3>PRO (COMING SOON)</h3>
-                        <p>This is the “win faster” version.</p>
-                        <div className="hr" />
-                        <ul style={{ margin: 0, paddingLeft: 18, fontWeight: 800, color: "rgba(10,59,35,0.9)" }}>
-                          <li>Click into each account for month-by-month snowball details</li>
-                          <li>Advanced stats + richer infographics</li>
-                          <li>Payday cycles + smarter prompts (later)</li>
-                          <li>More tools, more clarity, faster progress</li>
-                        </ul>
+                      <SelectField
+                        label="Type"
+                        value={a.type}
+                        onChange={(v) => updateAccount(a.id, { type: v as AccountType })}
+                        options={[
+                          { value: "Credit Card", label: "Credit Card" },
+                          { value: "Loan", label: "Loan" },
+                          { value: "Line of Credit", label: "Line of Credit" },
+                          { value: "Other", label: "Other" },
+                        ]}
+                      />
+
+                      <SelectField
+                        label="Due date"
+                        value={String(clamp(a.dueDate || 1, 1, 31))}
+                        onChange={(v) => updateAccount(a.id, { dueDate: clamp(parseInt(v, 10) || 1, 1, 31) })}
+                        options={Array.from({ length: 31 }).map((_, i) => {
+                          const day = i + 1;
+                          return { value: String(day), label: ordinal(day) };
+                        })}
+                      />
+                    </div>
+
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12 }}>
+                      <TextField
+                        label="Balance"
+                        value={getDraft(a.id, "balance", fmtMoneyInput(a.balance))}
+                        onChange={(v) => upsertDraft(a.id, "balance", keepNumericChars(v, true))}
+                        onBlur={() => {
+                          const n = parseMoneyLike(getDraft(a.id, "balance", fmtMoneyInput(a.balance)));
+                          updateAccount(a.id, { balance: Math.max(0, n) });
+                          clearDraft(a.id, "balance");
+                        }}
+                        placeholder="0"
+                        inputMode="decimal"
+                      />
+
+                      <TextField
+                        label="Limit"
+                        value={getDraft(a.id, "limit", fmtMoneyInput(a.limit))}
+                        onChange={(v) => upsertDraft(a.id, "limit", keepNumericChars(v, true))}
+                        onBlur={() => {
+                          const n = parseMoneyLike(getDraft(a.id, "limit", fmtMoneyInput(a.limit)));
+                          updateAccount(a.id, { limit: Math.max(0, n) });
+                          clearDraft(a.id, "limit");
+                        }}
+                        placeholder="0"
+                        inputMode="decimal"
+                      />
+
+                      <TextField
+                        label="APR %"
+                        value={getDraft(a.id, "apr", fmtPercentInput(a.apr))}
+                        onChange={(v) => upsertDraft(a.id, "apr", keepNumericChars(v, true))}
+                        onBlur={() => {
+                          const n = parsePercentLike(getDraft(a.id, "apr", fmtPercentInput(a.apr)));
+                          updateAccount(a.id, { apr: clamp(n, 0, 99.99) });
+                          clearDraft(a.id, "apr");
+                        }}
+                        placeholder="29.99"
+                        inputMode="decimal"
+                      />
+
+                      <TextField
+                        label="Next min payment"
+                        value={getDraft(a.id, "minPay", fmtMoneyInput(a.minPay))}
+                        onChange={(v) => upsertDraft(a.id, "minPay", keepNumericChars(v, true))}
+                        onBlur={() => {
+                          const n = parseMoneyLike(getDraft(a.id, "minPay", fmtMoneyInput(a.minPay)));
+                          updateAccount(a.id, { minPay: Math.max(0, n) });
+                          clearDraft(a.id, "minPay");
+                        }}
+                        placeholder="0"
+                        inputMode="decimal"
+                      />
+                    </div>
+
+                    <TextField
+                      label="Notes"
+                      value={getDraft(a.id, "notes", a.notes || "")}
+                      onChange={(v) => upsertDraft(a.id, "notes", v)}
+                      onBlur={() => {
+                        updateAccount(a.id, { notes: getDraft(a.id, "notes", a.notes || "") });
+                        clearDraft(a.id, "notes");
+                      }}
+                      placeholder="Optional"
+                    />
+
+                    <div style={{ display: "grid", gap: 8 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+                        <div style={{ fontSize: 16, fontWeight: 1000 }}>Monthly schedule (minimum only)</div>
+                        <Pill>
+                          Months: {a.balance > 0.01 ? (minOnly.stalled ? "—" : String(minOnly.monthsToPayoff)) : "0"}
+                        </Pill>
                       </div>
-                    )}
+
+                      {a.balance <= 0.01 ? (
+                        <div style={{ fontWeight: 900, opacity: 0.75 }}>Balance is $0. Add a balance to generate the schedule.</div>
+                      ) : stalled ? (
+                        <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                          Set a minimum payment to generate the schedule.
+                        </div>
+                      ) : minOnly.stalled ? (
+                        <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                          Payment is too low to reduce the balance. Increase minimum payment or reduce APR/balance.
+                        </div>
+                      ) : (
+                        <div style={{ overflowX: "auto" }}>
+                          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                            <thead>
+                              <tr style={{ textAlign: "left", opacity: 0.75 }}>
+                                <th style={{ padding: "8px 6px" }}>Month</th>
+                                <th style={{ padding: "8px 6px" }}>Total paid</th>
+                                <th style={{ padding: "8px 6px" }}>Interest</th>
+                                <th style={{ padding: "8px 6px" }}>Remaining</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {minOnly.monthPlans.slice(0, 12).map((mp) => (
+                                <tr key={mp.monthIndex} style={{ borderTop: "1px solid rgba(0,0,0,0.08)" }}>
+                                  <td style={{ padding: "8px 6px", fontWeight: 900 }}>{mp.monthIndex}</td>
+                                  <td style={{ padding: "8px 6px", fontWeight: 900 }}>{money(mp.totalPaid)}</td>
+                                  <td style={{ padding: "8px 6px", fontWeight: 900 }}>{money(mp.totalInterest)}</td>
+                                  <td style={{ padding: "8px 6px", fontWeight: 900 }}>{money(mp.remainingDebt)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
-
-                <div className="row" style={{ marginTop: 14 }}>
-                  {authMode === "signin" ? (
-                    <button className="btn primary" type="submit">
-                      Sign in
-                    </button>
-                  ) : (
-                    <button className="btn primary" type="submit" disabled={proSelected} title={proSelected ? "Pro coming soon" : ""}>
-                      {proSelected ? "Coming soon" : "Create account"}
-                    </button>
-                  )}
-
-                  <button
-                    className="btn"
-                    type="button"
-                    onClick={() => {
-                      setAuthMsg(null);
-                      setAuthMode(authMode === "signin" ? "signup" : "signin");
-                    }}
-                  >
-                    {authMode === "signin" ? "Create account" : "Back to sign in"}
-                  </button>
-                </div>
-
-                {authMsg && <div className={`toast ${authMsg.type}`}>{authMsg.text}</div>}
-              </form>
-
-              <div className="hr" />
-              <button className="smallLink" onClick={() => continueAsGuest()}>
-                Continue as guest (won’t save)
-              </button>
-            </div>
-
-            <div className="card">
-              <h2>What you get</h2>
-              <div className="muted">
-                Clear Path Payoff is built for people trying to repair credit and take control fast.
-              </div>
-              <div className="hr" />
-              <ul style={{ margin: 0, paddingLeft: 18, fontWeight: 800 }}>
-                <li>Add credit cards and loans</li>
-                <li>See monthly minimum totals</li>
-                <li>Choose Avalanche vs Snowball payoff strategy</li>
-                <li>See exactly where your extra money goes each month</li>
-                <li>Stats & charts that keep you motivated</li>
-              </ul>
-            </div>
-          </div>
+              </Card>
+            );
+          })}
         </div>
-        <GlobalStyles />
-      </>
+      </div>
     );
   }
 
-  // ====== APP SHELL ======
-  const greetingName = (session.name || session.email).trim();
-  const planLabel = isPro ? "PRO" : session.isGuest ? "GUEST" : "BASIC";
-
-  const showGuestBanner = session.isGuest;
-
-  return (
-    <>
-      <BackgroundArt />
-      <div className="app">
-        <div className="topbar">
-          <div className="brand">
-            <LogoMark />
-            <div>
-              <div className="brand-name">{APP_NAME}</div>
-              <div className="brand-sub">Hello, {greetingName}</div>
-            </div>
-          </div>
-
-          <div className="tabs">
-            <button className={`tab ${tab === "accounts" ? "active" : ""}`} onClick={() => setTab("accounts")}>
-              Accounts
-            </button>
-            <button className={`tab ${tab === "plan" ? "active" : ""}`} onClick={() => setTab("plan")}>
-              Plan
-            </button>
-            <button className={`tab ${tab === "stats" ? "active" : ""}`} onClick={() => setTab("stats")}>
-              Stats
-            </button>
-            <button className={`tab ${tab === "profile" ? "active" : ""}`} onClick={() => setTab("profile")}>
-              Profile
-            </button>
-            <span className={`badge ${isPro ? "pro" : ""}`}>{planLabel}</span>
-            <button className="btn" onClick={signOut}>
-              Sign out
-            </button>
-          </div>
+  function Plan() {
+    // Hide email + promo: we show plan logic, not credentials
+    const showMonthRows = (mp: MonthPlan | undefined) => {
+      if (!mp) return null;
+      return (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ textAlign: "left", opacity: 0.75 }}>
+                <th style={{ padding: "8px 6px" }}>Account</th>
+                <th style={{ padding: "8px 6px" }}>Min</th>
+                <th style={{ padding: "8px 6px" }}>Extra</th>
+                <th style={{ padding: "8px 6px" }}>Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {mp.allocations.map((r) => (
+                <tr key={r.accountId} style={{ borderTop: "1px solid rgba(0,0,0,0.08)" }}>
+                  <td style={{ padding: "8px 6px", fontWeight: 1000 }}>{r.name}</td>
+                  <td style={{ padding: "8px 6px", fontWeight: 900 }}>{money(r.min)}</td>
+                  <td style={{ padding: "8px 6px", fontWeight: 900 }}>{money(r.extra)}</td>
+                  <td style={{ padding: "8px 6px", fontWeight: 1000 }}>{money(r.total)}</td>
+                </tr>
+              ))}
+              <tr style={{ borderTop: "1px solid rgba(0,0,0,0.12)" }}>
+                <td style={{ padding: "10px 6px", fontWeight: 1000 }}>TOTAL</td>
+                <td style={{ padding: "10px 6px", fontWeight: 1000 }}>{money(mp.totalMin)}</td>
+                <td style={{ padding: "10px 6px", fontWeight: 1000 }}>{money(mp.totalExtra)}</td>
+                <td style={{ padding: "10px 6px", fontWeight: 1000 }}>{money(mp.totalPaid)}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
+      );
+    };
 
-        {showGuestBanner && (
-          <div className="banner" style={{ marginTop: 14 }}>
-            <h3>Save your progress with a free account</h3>
-            <p>
-              Guest mode won’t save your accounts or your plan. Creating a free account saves information and time.
-            </p>
-            <div className="row" style={{ marginTop: 10 }}>
-              <button
-                className="btn primary"
-                onClick={() => {
-                  // Sign out to return to login screen
-                  signOut();
-                }}
-              >
-                Create free account
-              </button>
-              <div className="muted" style={{ fontWeight: 900 }}>
-                You can edit this later.
+    const outcomeBox = (title: string, sim: SimResult, explainer: string) => (
+      <Card>
+        <div style={{ display: "grid", gap: 8 }}>
+          <div style={{ fontSize: 16, fontWeight: 1000 }}>{title}</div>
+          <div style={{ fontWeight: 900 }}>Payoff time: {sim.stalled ? "—" : `${sim.monthsToPayoff} mo`}</div>
+          <div style={{ fontWeight: 900 }}>Total interest: {money(sim.totalInterest)}</div>
+          <div style={{ fontWeight: 900, opacity: 0.75 }}>{explainer}</div>
+        </div>
+      </Card>
+    );
+
+    const ranked = rankAccounts(accounts, settings.payoffStyle).map((id) => accounts.find((a) => a.id === id)).filter(Boolean) as Account[];
+
+    return (
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 16px 28px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 14 }}>
+          <Card>
+            <div style={{ display: "grid", gap: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                <SelectField
+                  label="Payoff style"
+                  value={settings.payoffStyle}
+                  onChange={(v) =>
+                    saveSettings({
+                      ...settings,
+                      payoffStyle: v as Settings["payoffStyle"],
+                    })
+                  }
+                  options={[
+                    { value: "avalanche", label: "Avalanche (save interest over time)" },
+                    { value: "snowball", label: "Snowball (faster wins first)" },
+                  ]}
+                />
+
+                <TextField
+                  label="Extra this month (rolls forward)"
+                  value={getDraft("settings", "extra", fmtMoneyInput(settings.extraMonthly))}
+                  onChange={(v) => upsertDraft("settings", "extra", keepNumericChars(v, true))}
+                  onBlur={() => {
+                    const n = parseMoneyLike(getDraft("settings", "extra", fmtMoneyInput(settings.extraMonthly)));
+                    saveSettings({ ...settings, extraMonthly: Math.max(0, n) });
+                    clearDraft("settings", "extra");
+                  }}
+                  placeholder="0"
+                  inputMode="decimal"
+                />
               </div>
-            </div>
-          </div>
-        )}
 
-        {toast && <div className={`toast ${toast.type}`} style={{ marginTop: 14 }}>{toast.text}</div>}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                {outcomeBox(
+                  "Avalanche outcome",
+                  planSimAvalanche,
+                  "Highest APR first. Usually cheaper over time."
+                )}
+                {outcomeBox(
+                  "Snowball outcome",
+                  planSimSnowball,
+                  "Smallest balance first. Faster wins, sometimes more interest."
+                )}
+              </div>
 
-        {/* CONTENT */}
-        <div className="grid">
-          <div className="card">
-            {tab === "accounts" && (
-              <>
-                <div className="row">
-                  <h2 style={{ margin: 0 }}>Accounts</h2>
-                  <div className="row" style={{ gap: 8 }}>
-                    <button className="btn primary" onClick={openAdd}>
-                      Add account
-                    </button>
+              <div style={{ display: "grid", gap: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <div>
+                    <div style={{ fontSize: 18, fontWeight: 1000 }}>This month payment plan</div>
+                    <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                      Min + Extra = Total payment. Extra rolls into next target if one gets paid off.
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    <Pill>Extra: {money(settings.extraMonthly)}</Pill>
+                    <Pill>Total this month: {money(thisMonthPlan?.totalPaid ?? 0)}</Pill>
+                    <Button variant="ghost" onClick={() => setExpanded6((v) => !v)}>
+                      {expanded6 ? "Collapse" : "Expand (next 6 months)"}
+                    </Button>
                   </div>
                 </div>
-                <div className="muted">
-                  Add credit cards and loans. Next due date uses day 1–31.
-                </div>
 
-                <div className="hr" />
-
-                {selectedAccount && isPro ? (
-                  <>
-                    <div className="row">
-                      <div>
-                        <div style={{ fontWeight: 900, fontSize: 16 }}>{selectedAccount.name}</div>
-                        <div className="muted" style={{ fontWeight: 900 }}>
-                          Details view (minimum payments only) — shows how it snowballs if you do nothing.
-                        </div>
-                      </div>
-                      <button className="btn" onClick={() => setSelectedAccountId(null)}>
-                        Back to list
-                      </button>
-                    </div>
-
-                    <div className="hr" />
-
-                    <table className="table">
-                      <thead>
-                        <tr>
-                          <th>Month</th>
-                          <th>Start</th>
-                          <th>Interest</th>
-                          <th>Min Pay</th>
-                          <th>End</th>
-                          <th>Util%</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {detailsRows.map((r) => (
-                          <tr key={r.month}>
-                            <td>{r.month}</td>
-                            <td>{money(r.startBal)}</td>
-                            <td className="plus">+{money(r.interest)}</td>
-                            <td className="minus">-{money(r.minPay)}</td>
-                            <td style={{ fontWeight: 900 }}>{money(r.endBal)}</td>
-                            <td>{r.util === undefined ? "—" : pct(r.util)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-
-                    <div className="hr" />
-
-                    <div className="row" style={{ gap: 8 }}>
-                      <button className="btn" onClick={() => openEdit(selectedAccount)}>
-                        Edit
-                      </button>
-                      <button className="btn danger" onClick={() => deleteAccount(selectedAccount.id)}>
-                        Delete
-                      </button>
-                    </div>
-                  </>
+                {accounts.filter((a) => a.balance > 0.01).length === 0 ? (
+                  <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                    Add accounts with balances to generate a plan.
+                  </div>
+                ) : chosenSim.stalled ? (
+                  <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                    Plan is stalled. Check that each account has a minimum payment and APR is set correctly.
+                  </div>
                 ) : (
-                  <>
-                    {accounts.length === 0 ? (
-                      <div className="muted" style={{ fontWeight: 900 }}>
-                        No accounts yet. Add your first one.
-                      </div>
-                    ) : (
-                      <div style={{ display: "grid", gap: 10 }}>
-                        {accounts.map((a) => {
-                          const util =
-                            a.type === "credit_card" && a.creditLimit && a.creditLimit > 0
-                              ? (a.balance / a.creditLimit) * 100
-                              : undefined;
+                  <div style={{ display: "grid", gap: 12 }}>
+                    {showMonthRows(thisMonthPlan)}
 
-                          return (
-                            <div key={a.id} className="card" style={{ padding: 12 }}>
-                              <div className="row">
-                                <button
-                                  className="btn"
-                                  style={{ flex: 1, textAlign: "left" }}
-                                  onClick={() => handleAccountClick(a)}
-                                  title={!isPro ? "Pro required for details" : "View details"}
-                                >
-                                  <div style={{ fontWeight: 900, fontSize: 15 }}>{a.name}</div>
-                                  <div className="muted" style={{ fontWeight: 900 }}>
-                                    {a.type === "credit_card" ? "Credit card" : "Loan"} · APR {a.apr.toFixed(2)}% · Next due date: day{" "}
-                                    {a.nextDueDay}
-                                  </div>
-                                </button>
+                    {expanded6 && (
+                      <Card>
+                        <div style={{ display: "grid", gap: 10 }}>
+                          <div style={{ fontSize: 16, fontWeight: 1000 }}>Next 6 months (preview)</div>
+                          <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                            This is based on your current minimums + extra, with rollover into the next target.
+                          </div>
 
-                                <div style={{ minWidth: 210, textAlign: "right" }}>
-                                  <div style={{ fontWeight: 900 }}>{money(a.balance)}</div>
-                                  <div className="muted" style={{ fontWeight: 900 }}>
-                                    Min: {money(a.minPayment)} {util === undefined ? "" : ` · Util: ${pct(util)}`}
+                          <div style={{ display: "grid", gap: 14 }}>
+                            {nextMonthsPlans.slice(0, 6).map((mp) => (
+                              <div key={mp.monthIndex} style={{ display: "grid", gap: 8 }}>
+                                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                                  <div style={{ fontWeight: 1000 }}>Month {mp.monthIndex}</div>
+                                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                                    <Pill>Total paid: {money(mp.totalPaid)}</Pill>
+                                    <Pill>Interest: {money(mp.totalInterest)}</Pill>
+                                    <Pill>Remaining: {money(mp.remainingDebt)}</Pill>
                                   </div>
                                 </div>
-
-                                <button className="btn" onClick={() => openEdit(a)}>Edit</button>
+                                {showMonthRows(mp)}
                               </div>
-                            </div>
-                          );
-                        })}
-                      </div>
+                            ))}
+                          </div>
+                        </div>
+                      </Card>
                     )}
-                  </>
+                  </div>
                 )}
-              </>
-            )}
+              </div>
 
-            {tab === "plan" && (
-              <>
-                <div className="row">
-                  <h2 style={{ margin: 0 }}>Payoff Plan</h2>
-                  <span className={`badge ${isPro ? "pro" : ""}`}>{isPro ? "Pro tools enabled" : "Basic plan"}</span>
+              <div style={{ display: "grid", gap: 10 }}>
+                <div style={{ fontSize: 18, fontWeight: 1000 }}>
+                  Pay first ({settings.payoffStyle === "avalanche" ? "highest APR → lowest" : "smallest balance → largest"})
                 </div>
-
-                <div className="hr" />
-
-                <div className="formgrid">
-                  <div>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Payoff method
-                    </div>
-                    <select
-                      className="select"
-                      value={settings.method}
-                      onChange={(e) => updateSettings({ ...settings, method: e.target.value as any })}
-                    >
-                      <option value="avalanche">Avalanche (highest APR first)</option>
-                      <option value="snowball">Snowball (lowest balance first)</option>
-                    </select>
-                  </div>
-                  <div>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Amount extra (monthly)
-                    </div>
-                    <input
-                      className="input"
-                      value={String(settings.amountExtra ?? 0)}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        updateSettings({ ...settings, amountExtra: isFinite(v) ? v : 0 });
-                      }}
-                      inputMode="decimal"
-                    />
-                  </div>
-                </div>
-
-                <div className="hr" />
-
-                <div className="row">
-                  <div className="muted" style={{ fontWeight: 900 }}>
-                    Total monthly minimum:
-                  </div>
-                  <div style={{ fontWeight: 900 }}>{money(totalMin)}</div>
-                </div>
-                <div className="row" style={{ marginTop: 6 }}>
-                  <div className="muted" style={{ fontWeight: 900 }}>
-                    Amount extra:
-                  </div>
-                  <div style={{ fontWeight: 900 }}>{money(Math.max(0, settings.amountExtra || 0))}</div>
-                </div>
-                <div className="row" style={{ marginTop: 6 }}>
-                  <div className="muted" style={{ fontWeight: 900 }}>
-                    Total paid (est):
-                  </div>
-                  <div style={{ fontWeight: 900 }}>
-                    {money(totalMin + Math.max(0, settings.amountExtra || 0))}
-                  </div>
-                </div>
-
-                <div className="hr" />
-
-                {payoff.months.length === 0 ? (
-                  <div className="muted" style={{ fontWeight: 900 }}>
-                    Add accounts to see a plan.
-                  </div>
+                {ranked.length === 0 ? (
+                  <div style={{ fontWeight: 900, opacity: 0.75 }}>Add accounts to see ranked targets.</div>
                 ) : (
-                  <>
-                    <div className="muted" style={{ fontWeight: 900, marginBottom: 8 }}>
-                      Shows which account gets your extra money each month.
-                    </div>
-
-                    <table className="table">
-                      <thead>
-                        <tr>
-                          <th>Month</th>
-                          <th>Interest</th>
-                          <th>Min total</th>
-                          <th>Extra spent</th>
-                          <th>Total paid</th>
-                          <th>Extra allocation</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {payoff.months.slice(0, 12).map((m) => (
-                          <tr key={m.month}>
-                            <td>{m.month}</td>
-                            <td className="plus">+{money(m.interestTotal)}</td>
-                            <td className="minus">-{money(m.minTotal)}</td>
-                            <td className="minus">-{money(m.extraSpent)}</td>
-                            <td style={{ fontWeight: 900 }}>{money(m.totalPaid)}</td>
-                            <td>
-                              {m.extraByAccount.length === 0
-                                ? "—"
-                                : m.extraByAccount
-                                    .map((x) => `${x.name}: ${money(x.extra)}`)
-                                    .join(" · ")}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-
-                    <div className="hr" />
-                    <div className="muted" style={{ fontWeight: 900 }}>
-                      Tip: if you want to pay {money(1290.45)} or {money(1921.57)}, just type it into “Amount extra”.
-                    </div>
-                  </>
-                )}
-              </>
-            )}
-
-            {tab === "stats" && (
-              <>
-                <div className="row">
-                  <h2 style={{ margin: 0 }}>Stats</h2>
-                  <button className="btn" onClick={() => setToast(null)}>Clear message</button>
-                </div>
-
-                <div className="hr" />
-
-                <div className="formgrid">
-                  <StatCard title="Total balance" value={money(totalBalance)} />
-                  <StatCard title="Total monthly minimum" value={money(totalMin)} />
-                  <StatCard title="Extra budget" value={money(Math.max(0, settings.amountExtra || 0))} />
-                  <StatCard
-                    title="Plan method"
-                    value={settings.method === "avalanche" ? "Avalanche" : "Snowball"}
-                  />
-                </div>
-
-                <div className="hr" />
-
-                <div className="muted" style={{ fontWeight: 900 }}>
-                  Simple visual: balances by account
-                </div>
-                <div style={{ marginTop: 10, display: "grid", gap: 10 }}>
-                  {accounts.map((a) => {
-                    const w = totalBalance > 0 ? Math.round((a.balance / totalBalance) * 100) : 0;
-                    return (
-                      <div key={a.id} className="card" style={{ padding: 12 }}>
-                        <div className="row">
-                          <div style={{ fontWeight: 900 }}>{a.name}</div>
-                          <div style={{ fontWeight: 900 }}>{money(a.balance)}</div>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {ranked.slice(0, 8).map((a, idx) => (
+                      <div key={a.id} style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+                        <div style={{ fontWeight: 1000 }}>
+                          {idx + 1}. {a.name?.trim() || "Account"}
                         </div>
-                        <div style={{ height: 10, borderRadius: 999, overflow: "hidden", border: "1px solid rgba(20,40,26,0.15)", background: "rgba(255,255,255,0.55)", marginTop: 8 }}>
-                          <div style={{ width: `${w}%`, height: "100%", background: "rgba(47,111,78,0.35)" }} />
+                        <div style={{ fontWeight: 900, opacity: 0.8 }}>
+                          APR {a.apr.toFixed(2)}% • Bal {money(a.balance)} • Min {money(a.minPay)}
                         </div>
-                        <div className="muted" style={{ fontWeight: 900, marginTop: 6 }}>{w}% of total</div>
                       </div>
-                    );
-                  })}
-                  {accounts.length === 0 && (
-                    <div className="muted" style={{ fontWeight: 900 }}>
-                      Add accounts to see stats.
-                    </div>
-                  )}
-                </div>
-
-                {!isPro && (
-                  <>
-                    <div className="hr" />
-                    <div className="banner">
-                      <h3>Pro stats are deeper</h3>
-                      <p>
-                        Pro adds account-level “snowball cost” tables and richer infographics.
-                      </p>
-                      <div className="row" style={{ marginTop: 10 }}>
-                        <button className="btn primary" onClick={() => setTab("plan")}>
-                          Explore Pro
-                        </button>
-                      </div>
-                    </div>
-                  </>
+                    ))}
+                  </div>
                 )}
-              </>
-            )}
+              </div>
 
-            {tab === "profile" && (
-              <>
-                <div className="row">
-                  <h2 style={{ margin: 0 }}>Profile</h2>
-                  <span className={`badge ${isPro ? "pro" : ""}`}>{isPro ? "PRO enabled" : session.isGuest ? "GUEST" : "BASIC"}</span>
-                </div>
-
-                <div className="hr" />
-
-                <div className="formgrid">
-                  <div>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Name
-                    </div>
-                    <input
-                      className="input"
-                      value={profileName}
-                      onChange={(e) => setProfileName(e.target.value)}
-                      placeholder={session.email}
-                    />
-                    <div className="muted" style={{ fontWeight: 900, marginTop: 6 }}>
-                      Defaults to your email until you change it.
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Email
-                    </div>
-                    <input className="input" value={session.email} readOnly />
-                    <div className="muted" style={{ fontWeight: 900, marginTop: 6 }}>
-                      {session.isGuest ? "Guest mode does not save." : "Saved to your device (demo)."}
-                    </div>
-                  </div>
-                </div>
-
-                <div className="hr" />
-
-                <div className="formgrid">
-                  <div>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Current password
-                    </div>
-                    <input
-                      className="input"
-                      value={profileShowPw ? "(hidden in demo)" : "••••••••"}
-                      readOnly
-                    />
-                    <button className="smallLink" onClick={() => setProfileShowPw(!profileShowPw)}>
-                      {profileShowPw ? "Hide" : "Show"} password
-                    </button>
-                    <div className="muted" style={{ fontWeight: 900, marginTop: 6 }}>
-                      (Real password security will be added later.)
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-                      Change password
-                    </div>
-                    <input
-                      className="input"
-                      value={profileNewPw}
-                      onChange={(e) => setProfileNewPw(e.target.value)}
-                      placeholder="New password"
-                      type="password"
-                      disabled={session.isGuest}
-                    />
-                    <div className="muted" style={{ fontWeight: 900, marginTop: 6 }}>
-                      Leave blank to keep current password.
-                    </div>
-                  </div>
-                </div>
-
-                <div className="row" style={{ marginTop: 12 }}>
-                  <button className="btn primary" onClick={saveProfile} disabled={session.isGuest}>
-                    Save profile
-                  </button>
-                </div>
-
-                {profileMsg && <div className={`toast ${profileMsg.type}`}>{profileMsg.text}</div>}
-
-                <div className="hr" />
-
-                <div className="banner">
-                  <h3>Clear Path Payoff is built for momentum</h3>
-                  <p>
-                    Small consistent wins beat big perfect plans. Keep your plan simple and keep moving.
-                  </p>
-                </div>
-              </>
-            )}
-          </div>
-
-          {/* RIGHT SIDE PANEL */}
-          <div className="card">
-            <h2>Quick view</h2>
-            <div className="muted" style={{ fontWeight: 900 }}>
-              Your snapshot for this screen.
+              {/* Pro page graphic requirement: keep at least one graphic */}
+              <div style={{ display: "grid", gap: 12 }}>
+                <Card>
+                  <UsageBars rows={usageRows} />
+                </Card>
+              </div>
             </div>
-            <div className="hr" />
+          </Card>
+        </div>
+      </div>
+    );
+  }
 
-            {tab === "accounts" && (
-              <>
-                <MiniStat label="Accounts" value={`${accounts.length}`} />
-                <MiniStat label="Total balance" value={money(totalBalance)} />
-                <MiniStat label="Total minimum" value={money(totalMin)} />
-                <div className="hr" />
-                {!isPro && (
-                  <div className="banner">
-                    <h3>Unlock account details</h3>
-                    <p>Pro lets you click any account to see the month-by-month snowball effect.</p>
-                    <div className="row" style={{ marginTop: 10 }}>
-                      <button className="btn primary" onClick={() => setTab("plan")}>
-                        Explore Pro
-                      </button>
+  function Profile() {
+    const showPromoField = plan === "guest"; // never show promo after sign-in
+    const planOptions =
+      authMode === "create"
+        ? [
+            { value: "basic", label: "Basic" },
+            { value: "pro", label: "Pro (coming soon)" },
+          ]
+        : [{ value: "basic", label: "Basic" }];
+
+    return (
+      <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 16px 28px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14, alignItems: "start" }}>
+          <Card>
+            <div style={{ display: "grid", gap: 12 }}>
+              <div style={{ fontSize: 18, fontWeight: 1000 }}>Profile</div>
+
+              {plan === "guest" ? (
+                <>
+                  <div style={{ display: "flex", gap: 10 }}>
+                    <Button variant={authMode === "signin" ? "primary" : "ghost"} onClick={() => setAuthMode("signin")}>
+                      Sign in
+                    </Button>
+                    <Button variant={authMode === "create" ? "primary" : "ghost"} onClick={() => setAuthMode("create")}>
+                      Create account
+                    </Button>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 12 }}>
+                    <TextField
+                      label="Email"
+                      value={authEmail}
+                      onChange={setAuthEmail}
+                      placeholder="you@email.com"
+                      inputMode="email"
+                    />
+
+                    <SelectField
+                      label="Plan"
+                      value={selectedPlan}
+                      onChange={(v) => setSelectedPlan(v as Exclude<Plan, "guest">)}
+                      options={planOptions}
+                    />
+                  </div>
+
+                  <TextField
+                    label="Password"
+                    value={authPassword}
+                    onChange={setAuthPassword}
+                    placeholder="At least 8 characters"
+                  />
+
+                  {showPromoField && (
+                    <TextField
+                      label="Promo code (optional)"
+                      value={promoCode}
+                      onChange={setPromoCode}
+                      placeholder="Enter promo code"
+                    />
+                  )}
+
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    <Button onClick={authMode === "signin" ? signInUser : createUser}>
+                      {authMode === "signin" ? "Sign in" : "Create & sign in"}
+                    </Button>
+                    <Button variant="ghost" onClick={forgotPassword}>
+                      Forgot password?
+                    </Button>
+                  </div>
+
+                  <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.7 }}>
+                    Reset: email reset (Supabase) or local reset (deletes local data).
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                    <TextField
+                      label="Display name"
+                      value={getDraft("profile", "displayName", currentUser?.displayName ?? "")}
+                      onChange={(v) => upsertDraft("profile", "displayName", v)}
+                      onBlur={() => {
+                        const name = getDraft("profile", "displayName", currentUser?.displayName ?? "").trim();
+                        const usersNow = lsGet<UserRec[]>(KEY_USERS) ?? [];
+                        const idx = usersNow.findIndex((u) => normalizeEmail(u.email) === emailNorm);
+                        if (idx >= 0) {
+                          usersNow[idx] = { ...usersNow[idx], displayName: name };
+                          lsSet(KEY_USERS, usersNow);
+                        }
+                        clearDraft("profile", "displayName");
+                        setStatusMsg("Saved.");
+                      }}
+                      placeholder="e.g., Anthony"
+                    />
+
+                    <div style={{ display: "grid", gap: 6 }}>
+                      <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>Plan</div>
+                      <div style={{ padding: "11px 12px", borderRadius: 12, border: "1px solid rgba(0,0,0,0.16)", background: "rgba(255,255,255,0.78)", fontWeight: 1000 }}>
+                        {session?.plan === "pro" ? "Pro" : "Basic"}
+                      </div>
                     </div>
                   </div>
-                )}
-              </>
-            )}
 
-            {tab === "plan" && (
-              <>
-                <MiniStat label="Method" value={settings.method === "avalanche" ? "Avalanche" : "Snowball"} />
-                <MiniStat label="Monthly minimums" value={money(totalMin)} />
-                <MiniStat label="Extra budget" value={money(Math.max(0, settings.amountExtra || 0))} />
-                <MiniStat label="Total paid" value={money(totalMin + Math.max(0, settings.amountExtra || 0))} />
-                <div className="hr" />
-                <div className="muted" style={{ fontWeight: 900 }}>
-                  Pro pricing (ready when you are)
-                </div>
-                <div className="row" style={{ marginTop: 10 }}>
-                  <span className="badge">2.99 / month</span>
-                  <span className="badge pro">19.99 / year</span>
-                </div>
-                <div className="muted" style={{ fontWeight: 900, marginTop: 8 }}>
-                  Early access pricing
-                </div>
-              </>
-            )}
-
-            {tab === "stats" && (
-              <>
-                <MiniStat label="Total balance" value={money(totalBalance)} />
-                <MiniStat label="Min total" value={money(totalMin)} />
-                <MiniStat label="Extra" value={money(Math.max(0, settings.amountExtra || 0))} />
-                <div className="hr" />
-                <div className="muted" style={{ fontWeight: 900 }}>
-                  Want deeper charts? Pro expands this with more breakdowns.
-                </div>
-              </>
-            )}
-
-            {tab === "profile" && (
-              <>
-                <MiniStat label="Signed in as" value={session.isGuest ? "Guest" : session.email} />
-                <MiniStat label="Plan" value={isPro ? "Pro" : session.isGuest ? "Guest" : "Basic"} />
-                <div className="hr" />
-                {session.isGuest && (
-                  <div className="banner">
-                    <h3>Guest mode doesn’t save</h3>
-                    <p>Create an account to save accounts and settings.</p>
-                    <div className="row" style={{ marginTop: 10 }}>
-                      <button className="btn primary" onClick={() => signOut()}>
-                        Create account
-                      </button>
-                    </div>
+                  <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                    <Button variant="ghost" onClick={signOut}>Sign out</Button>
                   </div>
-                )}
-              </>
-            )}
+                </>
+              )}
+
+              {statusMsg && (
+                <div style={{ fontWeight: 900, opacity: 0.75, paddingTop: 6 }}>{statusMsg}</div>
+              )}
+            </div>
+          </Card>
+
+          <div style={{ display: "grid", gap: 14 }}>
+            <Card>
+              <div style={{ fontWeight: 1000, marginBottom: 8 }}>What you’ll get</div>
+              <div style={{ fontWeight: 900, opacity: 0.8, display: "grid", gap: 6 }}>
+                <div>• Usage % scoreboard</div>
+                <div>• Avalanche vs Snowball</div>
+                <div>• Monthly action list</div>
+              </div>
+            </Card>
+
+            <Card>
+              <div style={{ fontWeight: 1000, marginBottom: 8 }}>Quick totals</div>
+              <div style={{ fontWeight: 900, opacity: 0.85, display: "grid", gap: 6 }}>
+                <div>Total debt: {money(totals.totalDebt)}</div>
+                <div>Total min pay: {money(totals.totalMin)}</div>
+                <div>Interest/mo: {money(totals.interestThisMonth)}</div>
+              </div>
+            </Card>
+
+            {/* Graphic requirement (even here it’s fine) */}
+            <Card>
+              <PieChart title="Balances" labels={pieData.labels} values={pieData.values} />
+            </Card>
           </div>
         </div>
-
-        {/* Modals */}
-        <Modal open={editorOpen} title={editId ? "Edit account" : "Add account"} onClose={() => setEditorOpen(false)}>
-          <div className="formgrid">
-            <div>
-              <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>Type</div>
-              <select className="select" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value as any })}>
-                <option value="credit_card">Credit card</option>
-                <option value="loan">Loan</option>
-              </select>
-            </div>
-            <div>
-              <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>Account name</div>
-              <input className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Capital One / Car Loan / etc." />
-            </div>
-          </div>
-
-          <div className="formgrid" style={{ marginTop: 10 }}>
-            <div>
-              <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>APR (%)</div>
-              <input className="input" value={form.apr} onChange={(e) => setForm({ ...form, apr: e.target.value })} inputMode="decimal" />
-            </div>
-            <div>
-              <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>Balance</div>
-              <input className="input" value={form.balance} onChange={(e) => setForm({ ...form, balance: e.target.value })} inputMode="decimal" />
-            </div>
-          </div>
-
-          <div className="formgrid" style={{ marginTop: 10 }}>
-            <div>
-              <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>Minimum payment (monthly)</div>
-              <input className="input" value={form.minPayment} onChange={(e) => setForm({ ...form, minPayment: e.target.value })} inputMode="decimal" />
-            </div>
-            <div>
-              <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>Next due date (day 1–31)</div>
-              <select className="select" value={form.nextDueDay} onChange={(e) => setForm({ ...form, nextDueDay: e.target.value })}>
-                {Array.from({ length: 31 }, (_, i) => i + 1).map((d) => (
-                  <option key={d} value={String(d)}>{d}</option>
-                ))}
-              </select>
-            </div>
-          </div>
-
-          <div style={{ marginTop: 10 }}>
-            <div className="muted" style={{ fontSize: 12, fontWeight: 800, marginBottom: 6 }}>
-              Credit limit (optional) {form.type === "loan" ? "(usually leave blank)" : ""}
-            </div>
-            <input className="input" value={form.creditLimit} onChange={(e) => setForm({ ...form, creditLimit: e.target.value })} inputMode="decimal" />
-            <div className="muted" style={{ fontWeight: 900, marginTop: 6 }}>
-              Clear Path Payoff works better with a limit. You can continue without it — you can edit this later.
-            </div>
-          </div>
-
-          <div className="row" style={{ marginTop: 12 }}>
-            <button className="btn primary" onClick={saveAccount}>{editId ? "Save changes" : "Add account"}</button>
-            <button className="btn" onClick={() => setEditorOpen(false)}>Cancel</button>
-          </div>
-        </Modal>
-
-        <Modal open={lockedOpen} title="Unlock Account Insights" onClose={() => setLockedOpen(false)}>
-          <div style={{ fontWeight: 900 }}>
-            Pro lets you click into each account and see the month-by-month snowball effect:
-          </div>
-          <ul style={{ marginTop: 10, paddingLeft: 18, fontWeight: 900 }}>
-            <li>Interest added each month (red +)</li>
-            <li>Minimum payment impact (green -)</li>
-            <li>Balance trajectory and utilization</li>
-          </ul>
-          <div className="row" style={{ marginTop: 12 }}>
-            <button className="btn primary" onClick={() => { setLockedOpen(false); setTab("plan"); }}>
-              Explore Pro
-            </button>
-            <button className="btn" onClick={() => setLockedOpen(false)}>
-              Close
-            </button>
-          </div>
-        </Modal>
       </div>
+    );
+  }
 
-      {showAds && <AdBanner variant={adVariant} onUpgrade={() => setTab("plan")} />}
-
-      <GlobalStyles />
-    </>
-  );
-}
-
-function StatCard({ title, value }: { title: string; value: string }) {
   return (
-    <div className="card" style={{ padding: 12 }}>
-      <div className="muted" style={{ fontWeight: 900, fontSize: 12 }}>{title}</div>
-      <div style={{ fontWeight: 900, fontSize: 18 }}>{value}</div>
+    <div style={pageStyle}>
+      {/* spinner removal + nicer mobile feel */}
+      <style>{`
+        input::-webkit-outer-spin-button,
+        input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        input[type=number] { -moz-appearance: textfield; }
+      `}</style>
+
+      <Header />
+      <GuestBanner />
+      <Tabs />
+
+      {tab === "dashboard" && <Dashboard />}
+      {tab === "accounts" && <Accounts />}
+      {tab === "plan" && <Plan />}
+      {tab === "profile" && <Profile />}
     </div>
-  );
-}
-function MiniStat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="row" style={{ marginTop: 8 }}>
-      <div className="muted" style={{ fontWeight: 900 }}>{label}</div>
-      <div style={{ fontWeight: 900 }}>{value}</div>
-    </div>
-  );
-}
-
-function BackgroundArt() {
-  return (
-    <div className="bg-art" aria-hidden="true">
-      <div className="blob a" />
-      <div className="blob b" />
-      <div className="blob c" />
-      <div className="blob d" />
-    </div>
-  );
-}
-
-function GlobalStyles() {
-  return (
-    <style jsx global>{`
-      :root{
-        --bg: #cbd4c4;
-        --bg2:#e8efe2;
-        --card:#f7faf5;
-        --text:#0f1b12;
-        --muted:#3a4a3f;
-        --border: rgba(20,40,26,0.15);
-        --shadow: 0 12px 30px rgba(12, 20, 14, 0.12);
-        --accent:#2f6f4e;
-        --accent2:#7dbb95;
-        --good:#166534;
-        --bad:#b91c1c;
-        --banner:#d9ffea;
-        --bannerText:#0a3b23;
-      }
-      *{ box-sizing:border-box; }
-      html,body{ height:100%; }
-      body{
-        margin:0;
-        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji","Segoe UI Emoji";
-        color:var(--text);
-        background: radial-gradient(1200px 800px at 15% 10%, var(--bg2), var(--bg));
-      }
-      .bg-art{
-        position:fixed;
-        inset:0;
-        pointer-events:none;
-        opacity:0.55;
-        z-index:0;
-      }
-      .blob{
-        position:absolute;
-        filter: blur(2px);
-        border-radius: 999px;
-        mix-blend-mode: multiply;
-      }
-      .blob.a{ width:520px; height:280px; left:-120px; top:120px; background: rgba(255, 169, 169, 0.23); transform: rotate(10deg); }
-      .blob.b{ width:560px; height:320px; right:-160px; top:220px; background: rgba(153, 210, 255, 0.22); transform: rotate(-8deg); }
-      .blob.c{ width:620px; height:360px; left:120px; bottom:-160px; background: rgba(190, 255, 199, 0.18); transform: rotate(4deg); }
-      .blob.d{ width:420px; height:240px; right:120px; bottom:80px; background: rgba(255, 226, 153, 0.18); transform: rotate(-6deg); }
-
-      .app{
-        position:relative;
-        z-index:1;
-        max-width: 1100px;
-        margin: 0 auto;
-        padding: 18px 14px 92px;
-      }
-      .topbar{
-        display:flex;
-        align-items:center;
-        justify-content:space-between;
-        gap:12px;
-        padding: 14px 14px;
-        border: 1px solid var(--border);
-        background: rgba(247, 250, 245, 0.72);
-        backdrop-filter: blur(6px);
-        border-radius: 18px;
-        box-shadow: var(--shadow);
-      }
-      .brand{
-        display:flex;
-        align-items:center;
-        gap:10px;
-        min-width: 240px;
-      }
-      .brand-name{
-        font-weight: 800;
-        letter-spacing: 0.2px;
-        font-size: 18px;
-        line-height:1;
-      }
-      .brand-sub{
-        font-size: 12px;
-        color: var(--muted);
-        margin-top: 2px;
-        font-weight: 800;
-      }
-      .tabs{
-        display:flex;
-        gap:8px;
-        flex-wrap:wrap;
-        justify-content:flex-end;
-        align-items:center;
-      }
-      .tab{
-        border:1px solid var(--border);
-        background: rgba(255,255,255,0.55);
-        color: var(--text);
-        padding: 9px 12px;
-        border-radius: 999px;
-        cursor:pointer;
-        font-weight: 900;
-      }
-      .tab.active{
-        background: rgba(47,111,78,0.12);
-        border-color: rgba(47,111,78,0.35);
-      }
-      .badge{
-        font-size: 12px;
-        font-weight: 900;
-        padding: 6px 10px;
-        border-radius: 999px;
-        border:1px solid var(--border);
-        background: rgba(255,255,255,0.6);
-      }
-      .badge.pro{
-        border-color: rgba(47,111,78,0.45);
-        background: rgba(125,187,149,0.25);
-      }
-      .grid{
-        display:grid;
-        grid-template-columns: 1.25fr 0.75fr;
-        gap: 14px;
-        margin-top: 14px;
-      }
-      @media (max-width: 980px){
-        .grid{ grid-template-columns: 1fr; }
-      }
-      .card{
-        border:1px solid var(--border);
-        border-radius: 18px;
-        background: rgba(247, 250, 245, 0.82);
-        backdrop-filter: blur(6px);
-        box-shadow: var(--shadow);
-        padding: 14px;
-      }
-      .card h2{
-        margin:0 0 10px;
-        font-size: 16px;
-        font-weight: 900;
-      }
-      .muted{ color: var(--muted); font-weight: 800; }
-      .row{
-        display:flex;
-        gap:10px;
-        align-items:center;
-        justify-content:space-between;
-        flex-wrap:wrap;
-      }
-      .btn{
-        border:1px solid var(--border);
-        background: rgba(255,255,255,0.65);
-        padding: 10px 12px;
-        border-radius: 12px;
-        cursor:pointer;
-        font-weight: 900;
-      }
-      .btn.primary{
-        border-color: rgba(47,111,78,0.55);
-        background: rgba(47,111,78,0.12);
-      }
-      .btn.danger{
-        border-color: rgba(185,28,28,0.35);
-        background: rgba(185,28,28,0.10);
-      }
-      .btn:disabled{
-        opacity:0.55;
-        cursor:not-allowed;
-      }
-      .input, .select{
-        width:100%;
-        padding: 11px 12px;
-        border-radius: 12px;
-        border: 1px solid var(--border);
-        background: rgba(255,255,255,0.7);
-        outline: none;
-        font-weight: 900;
-      }
-      .input:focus, .select:focus{
-        border-color: rgba(47,111,78,0.45);
-        box-shadow: 0 0 0 4px rgba(125,187,149,0.18);
-      }
-      .formgrid{
-        display:grid;
-        grid-template-columns: 1fr 1fr;
-        gap:10px;
-      }
-      @media (max-width: 700px){
-        .formgrid{ grid-template-columns: 1fr; }
-      }
-      .hr{
-        height:1px;
-        background: var(--border);
-        margin: 12px 0;
-      }
-      .banner{
-        border-radius: 18px;
-        border: 1px solid rgba(47,111,78,0.28);
-        background: linear-gradient(90deg, var(--banner), rgba(125,187,149,0.22));
-        padding: 16px;
-        box-shadow: 0 10px 26px rgba(47,111,78,0.15);
-      }
-      .banner h3{
-        margin:0 0 6px;
-        font-size: 16px;
-        color: var(--bannerText);
-        font-weight: 900;
-      }
-      .banner p{ margin:0; color: rgba(10,59,35,0.82); font-weight: 900; }
-      .toast{
-        margin-top:10px;
-        padding: 10px 12px;
-        border-radius: 12px;
-        border:1px solid var(--border);
-        background: rgba(255,255,255,0.72);
-        font-weight: 900;
-      }
-      .toast.good{ border-color: rgba(22,101,52,0.35); color: var(--good); }
-      .toast.bad{ border-color: rgba(185,28,28,0.35); color: var(--bad); }
-      .table{
-        width:100%;
-        border-collapse: collapse;
-        overflow:hidden;
-        border-radius: 14px;
-        border: 1px solid var(--border);
-        background: rgba(255,255,255,0.6);
-      }
-      .table th,.table td{
-        padding: 10px 10px;
-        border-bottom:1px solid var(--border);
-        text-align:left;
-        font-size: 13px;
-        font-weight: 900;
-      }
-      .table th{
-        font-size: 12px;
-        text-transform: uppercase;
-        letter-spacing: 0.6px;
-        color: var(--muted);
-      }
-      .plus{ color: var(--bad); font-weight: 900; }
-      .minus{ color: var(--good); font-weight: 900; }
-      .adDock{
-        position:fixed;
-        left:0; right:0; bottom:0;
-        z-index: 5;
-        display:flex;
-        justify-content:center;
-        padding: 10px;
-        pointer-events:none;
-      }
-      .ad{
-        pointer-events:auto;
-        width:min(1100px, 98vw);
-        border-radius: 16px;
-        border:1px solid var(--border);
-        background: rgba(255,255,255,0.78);
-        backdrop-filter: blur(6px);
-        box-shadow: var(--shadow);
-        padding: 12px 14px;
-        display:flex;
-        align-items:center;
-        justify-content:space-between;
-        gap:12px;
-      }
-      .ad.compact{
-        padding: 8px 12px;
-        opacity:0.92;
-      }
-      .ad .tag{
-        font-size: 11px;
-        font-weight: 900;
-        letter-spacing: 0.4px;
-        color: var(--muted);
-      }
-      .ad .copy{
-        font-weight: 900;
-      }
-      .smallLink{
-        border:none;
-        background:transparent;
-        color: rgba(47,111,78,0.95);
-        font-weight: 900;
-        cursor:pointer;
-        text-decoration: underline;
-      }
-      .modalOverlay{
-        position:fixed; inset:0;
-        background: rgba(0,0,0,0.25);
-        display:flex; align-items:center; justify-content:center;
-        padding: 16px;
-        z-index: 10;
-      }
-      .modal{
-        width:min(680px, 98vw);
-        border-radius: 18px;
-        border:1px solid var(--border);
-        background: rgba(247,250,245,0.92);
-        backdrop-filter: blur(8px);
-        box-shadow: 0 18px 50px rgba(0,0,0,0.18);
-        padding: 14px;
-      }
-    `}</style>
   );
 }
