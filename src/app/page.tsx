@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useEffect, useMemo, useState } from "react";
-import { supabase } from "../lib/supabaseClient";
+import React, { useEffect, useId, useMemo, useState } from "react";
+import { supabase, supabaseConfigured } from "../lib/supabaseClient";
 
 /**
  * Clear Path Payoff — single-file build (Next.js App Router)
@@ -19,13 +19,14 @@ const TAGLINE = "Discipline scoreboard — simple now, smarter every version.";
 const MASTER_EMAIL = "abritton05@gmail.com";
 
 // Promo (never display the actual code in UI)
-const PROMO_CODE_PRO = "Family83";
+const PROMO_CODE_PRO = "FAMILY1983";
 
 // Storage keys
 const KEY_USERS = "cpp_users_v5";
 const KEY_SESSION = "cpp_session_v5";
 const KEY_ACCOUNTS_PREFIX = "cpp_accounts_v5_"; // + email
 const KEY_SETTINGS_PREFIX = "cpp_settings_v5_"; // + email
+const KEY_ONBOARDING_PREFIX = "cpp_onboarding_v1_";
 
 type Plan = "guest" | "basic" | "pro";
 type Session = { email: string; plan: Exclude<Plan, "guest"> };
@@ -96,6 +97,9 @@ const money = (n: number) =>
 function normalizeEmail(v: string) {
   return v.trim().toLowerCase();
 }
+function normalizePromoCode(v: string) {
+  return v.trim().toUpperCase();
+}
 function isMaster(email: string) {
   return normalizeEmail(email) === normalizeEmail(MASTER_EMAIL);
 }
@@ -126,6 +130,10 @@ function lsDel(key: string) {
   window.localStorage.removeItem(key);
 }
 
+function onboardingKey(email: string) {
+  return `${KEY_ONBOARDING_PREFIX}${normalizeEmail(email)}`;
+}
+
 function ordinal(n: number) {
   const v = n % 100;
   if (v >= 11 && v <= 13) return `${n}th`;
@@ -143,6 +151,30 @@ function monthlyRate(aprPct: number) {
 function sum(nums: number[]) {
   return nums.reduce((a, b) => a + b, 0);
 }
+
+function toggleItem(list: string[], item: string) {
+  return list.includes(item) ? list.filter((entry) => entry !== item) : [...list, item];
+}
+
+const ONBOARDING_GOALS = [
+  "Pay off credit card debt faster",
+  "Lower my credit utilization",
+  "Raise my credit score",
+  "Stop missing payments / stay organized",
+  "Build an emergency fund",
+  "Qualify for a car loan",
+  "Qualify for a mortgage or refinance",
+];
+
+const ONBOARDING_FOCUS = [
+  "Budgeting / spending control",
+  "Knowing what to pay first (avalanche vs snowball)",
+  "Keeping balances low",
+  "Remembering due dates",
+  "Understanding interest and APR",
+  "Building consistent habits",
+  "Staying motivated",
+];
 
 // ===== Crypto (salted SHA-256) =====
 function toHex(buf: ArrayBuffer) {
@@ -604,10 +636,14 @@ function TextField({
   inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
   onBlur?: () => void;
 }) {
+  const fieldId = useId();
   return (
-    <label style={{ display: "grid", gap: 6 }}>
-      <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>{label}</div>
+    <div style={{ display: "grid", gap: 6 }}>
+      <label htmlFor={fieldId} style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>
+        {label}
+      </label>
       <input
+        id={fieldId}
         value={value}
         placeholder={placeholder}
         inputMode={inputMode}
@@ -622,7 +658,7 @@ function TextField({
           fontSize: 14,
         }}
       />
-    </label>
+    </div>
   );
 }
 
@@ -637,10 +673,14 @@ function SelectField({
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
 }) {
+  const fieldId = useId();
   return (
-    <label style={{ display: "grid", gap: 6 }}>
-      <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>{label}</div>
+    <div style={{ display: "grid", gap: 6 }}>
+      <label htmlFor={fieldId} style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>
+        {label}
+      </label>
       <select
+        id={fieldId}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         style={{
@@ -658,16 +698,13 @@ function SelectField({
           </option>
         ))}
       </select>
-    </label>
+    </div>
   );
 }
 
 // ===== Page =====
 export default function Page() {
   const [hydrated, setHydrated] = useState(false);
-
-  // optional supabase status (informational)
-  const [supabaseConnected, setSupabaseConnected] = useState(false);
 
   // auth
   const [session, setSession] = useState<Session | null>(null);
@@ -686,6 +723,10 @@ export default function Page() {
     extraMonthly: 0,
     lastUpdatedAt: Date.now(),
   });
+  const [supabaseStatus, setSupabaseStatus] = useState<"checking" | "connected" | "not-connected">("checking");
+  const [goalSelections, setGoalSelections] = useState<string[]>([]);
+  const [workSelections, setWorkSelections] = useState<string[]>([]);
+  const [onboardingStep, setOnboardingStep] = useState<"goals" | "focus" | "loading" | null>(null);
 
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [expanded6, setExpanded6] = useState(false);
@@ -694,6 +735,7 @@ export default function Page() {
   const [draft, setDraft] = useState<Record<string, Record<string, string>>>({});
 
   const plan: Plan = session?.plan ?? "guest";
+  const isPro = session?.plan === "pro";
   const emailNorm = session?.email ? normalizeEmail(session.email) : "";
   const accountsKey = emailNorm ? `${KEY_ACCOUNTS_PREFIX}${emailNorm}` : "";
   const settingsKey = emailNorm ? `${KEY_SETTINGS_PREFIX}${emailNorm}` : "";
@@ -753,6 +795,15 @@ export default function Page() {
     });
   }
 
+  function startOnboarding(email: string) {
+    const existing = lsGet<{ completed?: boolean }>(onboardingKey(email));
+    if (existing?.completed) return;
+    setGoalSelections([]);
+    setWorkSelections([]);
+    setOnboardingStep("goals");
+    setTab("dashboard");
+  }
+
   // ===== auth operations =====
   async function createUser() {
     setStatusMsg("");
@@ -771,7 +822,7 @@ export default function Page() {
     const salt = randomSalt(16);
     const hash = await hashPassword(pw, salt);
 
-    const promoValid = promoCode.trim() !== "" && promoCode.trim() === PROMO_CODE_PRO;
+    const promoValid = normalizePromoCode(promoCode) !== "" && normalizePromoCode(promoCode) === PROMO_CODE_PRO;
     const basePlan: Exclude<Plan, "guest"> = selectedPlan === "pro" ? "basic" : selectedPlan; // pro not selectable directly
     const finalPlan = computePlanFromEmail(email, promoValid ? "pro" : basePlan);
 
@@ -787,22 +838,15 @@ export default function Page() {
     usersNow.push(rec);
     lsSet(KEY_USERS, usersNow);
 
-    const s: Session = { email, plan: finalPlan };
-    lsSet(KEY_SESSION, s);
-    setSession(s);
-
-    // init settings if missing
-    const existingSettings = lsGet<Settings>(`${KEY_SETTINGS_PREFIX}${email}`);
-    if (!existingSettings) {
-      lsSet(`${KEY_SETTINGS_PREFIX}${email}`, {
-        payoffStyle: "avalanche",
-        extraMonthly: 0,
-        lastUpdatedAt: Date.now(),
-      } satisfies Settings);
-    }
-
-    setTab("dashboard");
-    setStatusMsg("Signed in.");
+    const newSession: Session = { email, plan: finalPlan };
+    lsSet(KEY_SESSION, newSession);
+    setSession(newSession);
+    setAuthEmail("");
+    setAuthPassword("");
+    setPromoCode("");
+    setSelectedPlan("basic");
+    setStatusMsg("Account created. Signed in.");
+    startOnboarding(email);
   }
 
   async function signInUser() {
@@ -811,38 +855,30 @@ export default function Page() {
     const pw = authPassword;
 
     if (!email.includes("@")) return setStatusMsg("Enter a valid email.");
-    if (pw.length === 0) return setStatusMsg("Enter your password.");
 
     const usersNow = lsGet<UserRec[]>(KEY_USERS) ?? [];
-    const u = usersNow.find((x) => normalizeEmail(x.email) === email);
-    if (!u) return setStatusMsg("No account found. Switch to Create account.");
+    const rec = usersNow.find((u) => normalizeEmail(u.email) === email);
+    if (!rec) return setStatusMsg("Account not found. Create it first.");
 
-    const hash = await hashPassword(pw, u.passwordSalt);
-    if (hash !== u.passwordHash) return setStatusMsg("Wrong password.");
+    const hash = await hashPassword(pw, rec.passwordSalt);
+    if (hash !== rec.passwordHash) return setStatusMsg("Incorrect password.");
 
-    // allow promo on sign-in (guest typed it) to upgrade
-    const promoValid = promoCode.trim() !== "" && promoCode.trim() === PROMO_CODE_PRO;
-    let nextPlan = computePlanFromEmail(email, u.plan);
-
-    if (promoValid && !isMaster(email) && nextPlan !== "pro") {
-      // upgrade
-      u.plan = "pro";
-      nextPlan = "pro";
-      lsSet(KEY_USERS, usersNow);
-    }
-
-    const s: Session = { email, plan: nextPlan };
-    lsSet(KEY_SESSION, s);
-    setSession(s);
-    setTab("dashboard");
+    const plan = computePlanFromEmail(email, rec.plan);
+    const newSession: Session = { email, plan };
+    lsSet(KEY_SESSION, newSession);
+    setSession(newSession);
+    setAuthEmail("");
+    setAuthPassword("");
+    setPromoCode("");
+    setSelectedPlan("basic");
     setStatusMsg("Signed in.");
+    startOnboarding(email);
   }
 
   function signOut() {
     lsDel(KEY_SESSION);
     setSession(null);
     setSelectedAccountId(null);
-    setExpanded6(false);
     setStatusMsg("Signed out.");
   }
 
@@ -886,18 +922,42 @@ export default function Page() {
         plan: computePlanFromEmail(s.email, s.plan),
       };
       setSession(fixed);
+      startOnboarding(fixed.email);
+    }
+  }, []);
+
+  useEffect(() => {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const hasAnonKey = Boolean(process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY);
+    // eslint-disable-next-line no-console
+    console.log("Supabase env URL:", url);
+    // eslint-disable-next-line no-console
+    console.log("Supabase anon key exists:", hasAnonKey);
+
+    if (!supabaseConfigured) {
+      setSupabaseStatus("not-connected");
+      return;
     }
 
-    // supabase informational check
+    let active = true;
     (async () => {
       try {
-        const { data, error } = await supabase.auth.getSession();
-        if (error) return setSupabaseConnected(false);
-        setSupabaseConnected(!!data?.session);
-      } catch {
-        setSupabaseConnected(false);
+        const result = await supabase.auth.getSession();
+        // eslint-disable-next-line no-console
+        console.log("Supabase getSession:", result);
+        if (!active) return;
+        setSupabaseStatus(result.error ? "not-connected" : "connected");
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.log("Supabase getSession error:", error);
+        if (!active) return;
+        setSupabaseStatus("not-connected");
       }
     })();
+
+    return () => {
+      active = false;
+    };
   }, []);
 
   // load per-user data
@@ -916,6 +976,26 @@ export default function Page() {
     const st = lsGet<Settings>(settingsKey);
     if (st) setSettings(st);
   }, [hydrated, emailNorm]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (onboardingStep !== "loading") return;
+    const timer = window.setTimeout(() => {
+      if (emailNorm) {
+        lsSet(onboardingKey(emailNorm), {
+          completed: true,
+          goals: goalSelections,
+          focus: workSelections,
+          completedAt: Date.now(),
+        });
+      }
+      setOnboardingStep(null);
+      setTab("dashboard");
+    }, 5000);
+
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [onboardingStep, emailNorm, goalSelections, workSelections]);
 
   // ===== derived numbers =====
   const totals = useMemo(() => {
@@ -994,8 +1074,9 @@ export default function Page() {
   const selectedAccount = accounts.find((a) => a.id === selectedAccountId) ?? null;
 
   // ===== UI pieces =====
-  function Header() {
+  function renderHeader() {
     const signedName = plan === "guest" ? "Guest" : (currentUser?.displayName?.trim() || "Signed in");
+    const supabaseLabel = supabaseStatus === "connected" ? "Supabase: Connected" : "Supabase: Not connected";
     return (
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "22px 16px 8px" }}>
         <div
@@ -1031,8 +1112,8 @@ export default function Page() {
 
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
             <Pill>Plan: {plan === "guest" ? "Guest" : session?.plan === "pro" ? "Pro" : "Basic"}</Pill>
-            <Pill>Supabase: {supabaseConnected ? "connected" : "not connected"}</Pill>
             <Pill>{signedName}</Pill>
+            <Pill>{supabaseLabel}</Pill>
             {plan === "guest" ? (
               <Button variant="ghost" onClick={() => setTab("profile")}>
                 Sign in
@@ -1048,7 +1129,7 @@ export default function Page() {
     );
   }
 
-  function GuestBanner() {
+  function renderGuestBanner() {
     if (plan !== "guest") return null;
     return (
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "10px 16px 0" }}>
@@ -1085,7 +1166,7 @@ export default function Page() {
     );
   }
 
-  function Tabs() {
+  function renderTabs() {
     const tabs: { key: typeof tab; label: string }[] = [
       { key: "dashboard", label: "Dashboard" },
       { key: "accounts", label: "Accounts" },
@@ -1116,76 +1197,207 @@ export default function Page() {
     );
   }
 
-  function Dashboard() {
+  function renderDashboard() {
     const hello = plan === "guest" ? "Hello" : `Hello, ${currentUser?.displayName?.trim() || emailNorm}`;
     return (
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 16px 28px" }}>
         <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14, alignItems: "start" }}>
-          <Card>
-            <div style={{ display: "grid", gap: 10 }}>
-              <div>
-                <div style={{ fontSize: 22, fontWeight: 1000 }}>{hello}</div>
-                <div style={{ fontSize: 13, fontWeight: 900, opacity: 0.75 }}>
-                  Your payoff scoreboard — fast to read, built to push action.
-                </div>
-              </div>
-
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <Pill>Total debt: {money(totals.totalDebt)}</Pill>
-                <Pill>Total min pay: {money(totals.totalMin)}</Pill>
-                <Pill>Interest/mo: {money(totals.interestThisMonth)}</Pill>
-              </div>
-
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-                <Card>
-                  <PieChart title="Balances" labels={pieData.labels} values={pieData.values} />
-                </Card>
-                <Card>
-                  <UsageBars rows={usageRows} />
-                </Card>
-              </div>
-
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <Button onClick={() => { setTab("accounts"); addAccount(); }}>+ Add account</Button>
-                <Button variant="ghost" onClick={() => setTab("accounts")}>View accounts</Button>
-                <Button variant="ghost" onClick={() => setTab("plan")}>View plan</Button>
-              </div>
-            </div>
-          </Card>
-
           <div style={{ display: "grid", gap: 14 }}>
             <Card>
               <div style={{ display: "grid", gap: 10 }}>
-                <div style={{ fontWeight: 1000, fontSize: 16 }}>Pro insight: snapshot</div>
-                <div style={{ fontWeight: 900, opacity: 0.8 }}>
-                  {money(totals.interestThisMonth)} interest / {money(totals.totalMin)} minimums
+                <div>
+                  <div style={{ fontSize: 22, fontWeight: 1000 }}>{hello}</div>
+                  <div style={{ fontSize: 13, fontWeight: 900, opacity: 0.75 }}>
+                    Your payoff scoreboard — fast to read, built to push action.
+                  </div>
                 </div>
-                <div style={{ fontWeight: 900, opacity: 0.8 }}>Total debt: {money(totals.totalDebt)}</div>
-                <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.7 }}>
-                  This uses all accounts (not one).
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <Pill>Total debt: {money(totals.totalDebt)}</Pill>
+                  <Pill>Total min pay: {money(totals.totalMin)}</Pill>
+                  <Pill>Interest/mo: {money(totals.interestThisMonth)}</Pill>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                  <Card>
+                    <PieChart title="Balances" labels={pieData.labels} values={pieData.values} />
+                  </Card>
+                  <Card>
+                    <UsageBars rows={usageRows} />
+                  </Card>
+                </div>
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <Button onClick={() => { setTab("accounts"); addAccount(); }}>+ Add account</Button>
+                  <Button variant="ghost" onClick={() => setTab("accounts")}>View accounts</Button>
+                  <Button variant="ghost" onClick={() => setTab("plan")}>View plan</Button>
                 </div>
               </div>
             </Card>
+          </div>
 
-            <Card>
-              <div style={{ fontWeight: 1000, fontSize: 16, marginBottom: 10 }}>Quick totals</div>
-              <div style={{ display: "grid", gap: 6, fontWeight: 900, opacity: 0.85 }}>
-                <div>Total debt: {money(totals.totalDebt)}</div>
-                <div>Total min pay: {money(totals.totalMin)}</div>
-                <div>Interest/mo: {money(totals.interestThisMonth)}</div>
-              </div>
-            </Card>
+          <div style={{ display: "grid", gap: 14 }}>
+            {isPro ? (
+              <>
+                <Card>
+                  <div style={{ display: "grid", gap: 10 }}>
+                    <div style={{ fontWeight: 1000, fontSize: 16 }}>Pro insight: snapshot</div>
+                    <div style={{ fontWeight: 900, opacity: 0.8 }}>
+                      {money(totals.interestThisMonth)} interest / {money(totals.totalMin)} minimums
+                    </div>
+                    <div style={{ fontWeight: 900, opacity: 0.8 }}>Total debt: {money(totals.totalDebt)}</div>
+                    <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.7 }}>
+                      This uses all accounts (not one).
+                    </div>
+                  </div>
+                </Card>
 
-            <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.6, paddingLeft: 4 }}>
-              Demo build • Local storage • Supabase reset optional
-            </div>
+                <Card>
+                  <div style={{ fontWeight: 1000, fontSize: 16, marginBottom: 10 }}>Quick totals</div>
+                  <div style={{ display: "grid", gap: 6, fontWeight: 900, opacity: 0.85 }}>
+                    <div>Total debt: {money(totals.totalDebt)}</div>
+                    <div>Total min pay: {money(totals.totalMin)}</div>
+                    <div>Interest/mo: {money(totals.interestThisMonth)}</div>
+                  </div>
+                </Card>
+              </>
+            ) : (
+              <Card>
+                <div style={{ display: "grid", gap: 8 }}>
+                  <div style={{ fontWeight: 1000, fontSize: 16 }}>Quick view</div>
+                  <div style={{ fontWeight: 900, opacity: 0.75 }}>Only available in Pro.</div>
+                </div>
+              </Card>
+            )}
+
           </div>
         </div>
       </div>
     );
   }
 
-  function Accounts() {
+  function renderOnboardingOverlay() {
+    if (!onboardingStep || plan === "guest") return null;
+    const isLoading = onboardingStep === "loading";
+    const title =
+      onboardingStep === "goals"
+        ? "Question 1 — What are your credit goals?"
+        : onboardingStep === "focus"
+        ? "Question 2 — What areas do you feel like you need to work on?"
+        : "Creating your personal Dashboard";
+    const subtitle =
+      onboardingStep === "loading"
+        ? "Hang tight — this takes about 5 seconds."
+        : "Select all that apply.";
+    return (
+      <div
+        style={{
+          position: "fixed",
+          inset: 0,
+          background: "rgba(8,12,10,0.55)",
+          display: "grid",
+          placeItems: "center",
+          zIndex: 999,
+          padding: 16,
+        }}
+      >
+        <div
+          style={{
+            width: "min(780px, 96vw)",
+            background: "rgba(255,255,255,0.98)",
+            borderRadius: 22,
+            padding: 24,
+            border: "1px solid rgba(0,0,0,0.12)",
+            boxShadow: "0 20px 60px rgba(0,0,0,0.25)",
+            display: "grid",
+            gap: 16,
+          }}
+        >
+          <style>{`
+            @keyframes onboardingSpin { 
+              from { transform: rotate(0deg); } 
+              to { transform: rotate(360deg); } 
+            }
+          `}</style>
+          <div style={{ display: "grid", gap: 6 }}>
+            <div style={{ fontSize: 20, fontWeight: 1000 }}>{title}</div>
+            <div style={{ fontWeight: 900, opacity: 0.7 }}>{subtitle}</div>
+          </div>
+
+          {!isLoading && onboardingStep === "goals" && (
+            <div style={{ display: "grid", gap: 8 }}>
+              {ONBOARDING_GOALS.map((goal) => (
+                <label key={goal} style={{ display: "flex", alignItems: "center", gap: 10, fontWeight: 900 }}>
+                  <input
+                    type="checkbox"
+                    checked={goalSelections.includes(goal)}
+                    onChange={() => setGoalSelections((prev) => toggleItem(prev, goal))}
+                  />
+                  <span>{goal}</span>
+                </label>
+              ))}
+            </div>
+          )}
+
+          {!isLoading && onboardingStep === "focus" && (
+            <div style={{ display: "grid", gap: 8 }}>
+              {ONBOARDING_FOCUS.map((area) => (
+                <label key={area} style={{ display: "flex", alignItems: "center", gap: 10, fontWeight: 900 }}>
+                  <input
+                    type="checkbox"
+                    checked={workSelections.includes(area)}
+                    onChange={() => setWorkSelections((prev) => toggleItem(prev, area))}
+                  />
+                  <span>{area}</span>
+                </label>
+              ))}
+            </div>
+          )}
+
+          {isLoading && (
+            <div style={{ display: "grid", justifyItems: "center", gap: 10, padding: "10px 0" }}>
+              <div style={{ display: "flex", gap: 18, alignItems: "center" }}>
+                <span style={{ fontSize: 36, display: "inline-block", animation: "onboardingSpin 2s linear infinite" }}>
+                  ⚙️
+                </span>
+                <span
+                  style={{
+                    fontSize: 30,
+                    display: "inline-block",
+                    animation: "onboardingSpin 2s linear infinite reverse",
+                  }}
+                >
+                  ⚙️
+                </span>
+              </div>
+              <div style={{ fontWeight: 900 }}>Creating your personal Dashboard</div>
+            </div>
+          )}
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+            <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.7 }}>
+              {onboardingStep === "goals" ? "Step 1 of 2" : onboardingStep === "focus" ? "Step 2 of 2" : "Final step"}
+            </div>
+            {!isLoading && (
+              <Button
+                onClick={() => {
+                  if (onboardingStep === "goals") {
+                    setOnboardingStep("focus");
+                  } else if (onboardingStep === "focus") {
+                    setOnboardingStep("loading");
+                  }
+                }}
+              >
+                Next
+              </Button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderAccounts() {
     return (
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "14px 16px 28px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
@@ -1392,7 +1604,7 @@ export default function Page() {
     );
   }
 
-  function Plan() {
+  function renderPlan() {
     // Hide email + promo: we show plan logic, not credentials
     const showMonthRows = (mp: MonthPlan | undefined) => {
       if (!mp) return null;
@@ -1583,7 +1795,7 @@ export default function Page() {
     );
   }
 
-  function Profile() {
+  function renderProfile() {
     const showPromoField = plan === "guest"; // never show promo after sign-in
     const planOptions =
       authMode === "create"
@@ -1640,7 +1852,7 @@ export default function Page() {
                       label="Promo code (optional)"
                       value={promoCode}
                       onChange={setPromoCode}
-                      placeholder="Enter promo code"
+                      placeholder="Family1983"
                     />
                   )}
 
@@ -1653,9 +1865,6 @@ export default function Page() {
                     </Button>
                   </div>
 
-                  <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.7 }}>
-                    Reset: email reset (Supabase) or local reset (deletes local data).
-                  </div>
                 </>
               ) : (
                 <>
@@ -1736,14 +1945,15 @@ export default function Page() {
         input[type=number] { -moz-appearance: textfield; }
       `}</style>
 
-      <Header />
-      <GuestBanner />
-      <Tabs />
+      {renderOnboardingOverlay()}
+      {renderHeader()}
+      {renderGuestBanner()}
+      {renderTabs()}
 
-      {tab === "dashboard" && <Dashboard />}
-      {tab === "accounts" && <Accounts />}
-      {tab === "plan" && <Plan />}
-      {tab === "profile" && <Profile />}
+      {tab === "dashboard" && renderDashboard()}
+      {tab === "accounts" && renderAccounts()}
+      {tab === "plan" && renderPlan()}
+      {tab === "profile" && renderProfile()}
     </div>
   );
 }
