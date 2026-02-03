@@ -1190,7 +1190,10 @@ export default function Page() {
   // ===== UI pieces =====
   function renderHeader() {
     const signedName = plan === "guest" ? "Guest" : (currentUser?.displayName?.trim() || "Signed in");
-    const supabaseLabel = supabaseStatus === "connected" ? "Supabase: Connected" : "Supabase: Not connected";
+    const supabaseIsConfigured = Boolean(
+      process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    );
+    const showSupabaseWarning = process.env.NODE_ENV === "development" && !supabaseIsConfigured;
     return (
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "22px 16px 8px" }}>
         <div
@@ -1225,9 +1228,9 @@ export default function Page() {
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <Pill>Plan: {plan === "guest" ? "Guest" : isPro ? "Pro" : "Basic"}</Pill>
             <Pill>{signedName}</Pill>
-            <Pill>{supabaseLabel}</Pill>
+            {isPro && <Pill>Pro ✨</Pill>}
+            {showSupabaseWarning && <Pill>Supabase: not configured</Pill>}
             {plan === "guest" ? (
               <Button variant="ghost" onClick={() => setTab("profile")}>
                 Sign in
@@ -1267,10 +1270,13 @@ export default function Page() {
               Create Basic to save locally. Promo unlocks Pro.
             </div>
           </div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <Button onClick={() => { setAuthMode("create"); setSelectedPlan("basic"); setTab("profile"); }}>
-              Create Basic
-            </Button>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <Button onClick={() => { setAuthMode("create"); setSelectedPlan("basic"); setTab("profile"); }}>
+                Create Basic
+              </Button>
+              {isPro && <span style={{ fontWeight: 900 }}>Pro ✨</span>}
+            </div>
             <Button variant="ghost" onClick={() => { setAuthMode("signin"); setTab("profile"); }}>
               Sign in
             </Button>
