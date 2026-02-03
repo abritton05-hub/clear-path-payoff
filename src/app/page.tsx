@@ -1,11 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import GoalsModal from "@/components/GoalsModal";
-
-
-import React, { useEffect, useId, useMemo, useState } from "react";
 import { supabase, supabaseConfigured } from "../lib/supabaseClient";
+
 
 /**
  * Clear Path Payoff — single-file build (Next.js App Router)
