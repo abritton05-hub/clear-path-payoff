@@ -1,5 +1,9 @@
 "use client";
 
+import { useState } from "react";
+import GoalsModal from "@/components/GoalsModal";
+
+
 import React, { useEffect, useId, useMemo, useState } from "react";
 import { supabase, supabaseConfigured } from "../lib/supabaseClient";
 
@@ -1801,7 +1805,7 @@ export default function Page() {
       authMode === "create"
         ? [
             { value: "basic", label: "Basic" },
-            { value: "pro", label: "Pro (coming soon)" },
+            { value: "pro", label: "Pro )" },
           ]
         : [{ value: "basic", label: "Basic" }];
 
