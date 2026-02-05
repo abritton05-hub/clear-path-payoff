@@ -1,9 +1,10 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import AppShell from "@/components/AppShell";
 
 export const metadata: Metadata = {
-  title: "Clear Path Payoff",
-  description: "Discipline scoreboard — simple moves, massive results.",
+  title: "Clear Payoff",
+  description: "Clear Payoff payoff planner and credit goals dashboard.",
 };
 
 export default function RootLayout({
@@ -13,7 +14,11 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body
+        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
+      >
+        <AppShell>{children}</AppShell>
+      </body>
     </html>
   );
 }

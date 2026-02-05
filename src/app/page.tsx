@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useId, useMemo, useState } from "react";
-import GoalsModal from "@/components/GoalsModal";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase, supabaseConfigured } from "../lib/supabaseClient";
-
+import { isPro as isProProfile, type ProfileRecord } from "../lib/pro";
+import type { PlanKey } from "../lib/plans";
+import GoalsModal from "../components/GoalsModal";
 
 /**
  * Clear Path Payoff — single-file build (Next.js App Router)
@@ -17,7 +18,7 @@ import { supabase, supabaseConfigured } from "../lib/supabaseClient";
 
 // ===== Config =====
 const APP_NAME = "Clear Path Payoff";
-const TAGLINE = "Discipline scoreboard — simple now, smarter every version.";
+const TAGLINE = "Easy now. Easier tomorrow.";
 const MASTER_EMAIL = "abritton05@gmail.com";
 
 // Promo (never display the actual code in UI)
@@ -530,7 +531,15 @@ function UsageBars({
 }
 
 // ===== UI =====
-function Card({ children }: { children: React.ReactNode }) {
+function Card({
+  children,
+  style,
+  onClick,
+}: {
+  children: React.ReactNode;
+  style?: React.CSSProperties;
+  onClick?: () => void;
+}) {
   return (
     <div
       style={{
@@ -540,7 +549,9 @@ function Card({ children }: { children: React.ReactNode }) {
         backdropFilter: "blur(8px)",
         boxShadow: "0 10px 30px rgba(0,0,0,0.10)",
         padding: 16,
+        ...style,
       }}
+      onClick={onClick}
     >
       {children}
     </div>
@@ -630,6 +641,7 @@ function TextField({
   placeholder,
   inputMode,
   onBlur,
+  id,
 }: {
   label: string;
   value: string;
@@ -637,8 +649,10 @@ function TextField({
   placeholder?: string;
   inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
   onBlur?: () => void;
+  id?: string;
 }) {
-  const fieldId = useId();
+  const fallbackId = useRef(`field-${Math.random().toString(36).slice(2)}`);
+  const fieldId = id ?? fallbackId.current;
   return (
     <div style={{ display: "grid", gap: 6 }}>
       <label htmlFor={fieldId} style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>
@@ -669,13 +683,16 @@ function SelectField({
   value,
   onChange,
   options,
+  id,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
+  id?: string;
 }) {
-  const fieldId = useId();
+  const fallbackId = useRef(`field-${Math.random().toString(36).slice(2)}`);
+  const fieldId = id ?? fallbackId.current;
   return (
     <div style={{ display: "grid", gap: 6 }}>
       <label htmlFor={fieldId} style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>
@@ -726,9 +743,14 @@ export default function Page() {
     lastUpdatedAt: Date.now(),
   });
   const [supabaseStatus, setSupabaseStatus] = useState<"checking" | "connected" | "not-connected">("checking");
-  const [goalSelections, setGoalSelections] = useState<string[]>([]);
+  const [profile, setProfile] = useState<ProfileRecord | null>(null);
+  const [openGoals, setOpenGoals] = useState(false);
+  const [selectedGoals, setSelectedGoals] = useState<string[]>([]);
   const [workSelections, setWorkSelections] = useState<string[]>([]);
   const [onboardingStep, setOnboardingStep] = useState<"goals" | "focus" | "loading" | null>(null);
+  const [paywallOpen, setPaywallOpen] = useState(false);
+  const [paywallError, setPaywallError] = useState<string | null>(null);
+  const [checkoutPlan, setCheckoutPlan] = useState<PlanKey | null>(null);
 
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [expanded6, setExpanded6] = useState(false);
@@ -737,7 +759,7 @@ export default function Page() {
   const [draft, setDraft] = useState<Record<string, Record<string, string>>>({});
 
   const plan: Plan = session?.plan ?? "guest";
-  const isPro = session?.plan === "pro";
+  const isPro = session?.plan === "pro" || isProProfile(profile);
   const emailNorm = session?.email ? normalizeEmail(session.email) : "";
   const accountsKey = emailNorm ? `${KEY_ACCOUNTS_PREFIX}${emailNorm}` : "";
   const settingsKey = emailNorm ? `${KEY_SETTINGS_PREFIX}${emailNorm}` : "";
@@ -800,7 +822,7 @@ export default function Page() {
   function startOnboarding(email: string) {
     const existing = lsGet<{ completed?: boolean }>(onboardingKey(email));
     if (existing?.completed) return;
-    setGoalSelections([]);
+    setSelectedGoals([]);
     setWorkSelections([]);
     setOnboardingStep("goals");
     setTab("dashboard");
@@ -840,15 +862,23 @@ export default function Page() {
     usersNow.push(rec);
     lsSet(KEY_USERS, usersNow);
 
-    const newSession: Session = { email, plan: finalPlan };
-    lsSet(KEY_SESSION, newSession);
-    setSession(newSession);
-    setAuthEmail("");
-    setAuthPassword("");
-    setPromoCode("");
-    setSelectedPlan("basic");
-    setStatusMsg("Account created. Signed in.");
+    const s: Session = { email, plan: finalPlan };
+    lsSet(KEY_SESSION, s);
+    setSession(s);
+
+    // init settings if missing
+    const existingSettings = lsGet<Settings>(`${KEY_SETTINGS_PREFIX}${email}`);
+    if (!existingSettings) {
+      lsSet(`${KEY_SETTINGS_PREFIX}${email}`, {
+        payoffStyle: "avalanche",
+        extraMonthly: 0,
+        lastUpdatedAt: Date.now(),
+      } satisfies Settings);
+    }
+
+    setTab("dashboard");
     startOnboarding(email);
+    setStatusMsg("Signed in.");
   }
 
   async function signInUser() {
@@ -859,20 +889,28 @@ export default function Page() {
     if (!email.includes("@")) return setStatusMsg("Enter a valid email.");
 
     const usersNow = lsGet<UserRec[]>(KEY_USERS) ?? [];
-    const rec = usersNow.find((u) => normalizeEmail(u.email) === email);
-    if (!rec) return setStatusMsg("Account not found. Create it first.");
+    const u = usersNow.find((x) => normalizeEmail(x.email) === email);
+    if (!u) return setStatusMsg("No account found. Switch to Create account.");
 
-    const hash = await hashPassword(pw, rec.passwordSalt);
-    if (hash !== rec.passwordHash) return setStatusMsg("Incorrect password.");
+    const hash = await hashPassword(pw, u.passwordSalt);
+    if (hash !== u.passwordHash) return setStatusMsg("Wrong password.");
 
-    const plan = computePlanFromEmail(email, rec.plan);
-    const newSession: Session = { email, plan };
-    lsSet(KEY_SESSION, newSession);
-    setSession(newSession);
-    setAuthEmail("");
-    setAuthPassword("");
-    setPromoCode("");
-    setSelectedPlan("basic");
+    // allow promo on sign-in (guest typed it) to upgrade
+    const promoValid = normalizePromoCode(promoCode) !== "" && normalizePromoCode(promoCode) === PROMO_CODE_PRO;
+    let nextPlan = computePlanFromEmail(email, u.plan);
+
+    if (promoValid && !isMaster(email) && nextPlan !== "pro") {
+      // upgrade
+      u.plan = "pro";
+      nextPlan = "pro";
+      lsSet(KEY_USERS, usersNow);
+    }
+
+    const s: Session = { email, plan: nextPlan };
+    lsSet(KEY_SESSION, s);
+    setSession(s);
+    setTab("dashboard");
+    startOnboarding(email);
     setStatusMsg("Signed in.");
     startOnboarding(email);
   }
@@ -881,36 +919,90 @@ export default function Page() {
     lsDel(KEY_SESSION);
     setSession(null);
     setSelectedAccountId(null);
+    setExpanded6(false);
+    setOnboardingStep(null);
     setStatusMsg("Signed out.");
+  }
+
+  async function loadProfile(userId: string) {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select(
+        "is_pro, pro_plan, pro_expires_at, stripe_customer_id, stripe_subscription_id"
+      )
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error || !data) {
+      setProfile(null);
+      return;
+    }
+
+    setProfile({
+      is_pro: data.is_pro,
+      pro_plan: data.pro_plan,
+      pro_expires_at: data.pro_expires_at,
+    });
+  }
+
+  async function startCheckout(planKey: PlanKey) {
+    setPaywallError(null);
+    setCheckoutPlan(planKey);
+
+    try {
+      if (!supabaseConfigured) {
+        setPaywallError("Supabase not configured.");
+        return;
+      }
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) {
+        setPaywallError("Please sign in with Supabase to unlock Pro.");
+        return;
+      }
+
+      const response = await fetch("/api/stripe/checkout", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ plan: planKey }),
+      });
+
+      const payload = await response.json();
+      if (!response.ok || !payload.url) {
+        setPaywallError(payload.error ?? "Unable to start checkout.");
+        return;
+      }
+
+      window.location.href = payload.url;
+    } catch (error) {
+      setPaywallError("Unable to start checkout.");
+    } finally {
+      setCheckoutPlan(null);
+    }
   }
 
   async function forgotPassword() {
     setStatusMsg("");
     const email = normalizeEmail(authEmail);
     if (!email.includes("@")) return setStatusMsg("Type your email first.");
+    if (!supabaseConfigured) return setStatusMsg("Supabase not configured.");
 
-    // Try Supabase reset if configured
     try {
+      const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? window.location.origin;
       const { error } = await supabase.auth.resetPasswordForEmail(email, {
-        redirectTo: `${window.location.origin}/`,
+        redirectTo: `${appUrl}/auth/reset-password`,
       });
       if (!error) {
-        setStatusMsg("Reset email sent (if Supabase is configured). Check your inbox.");
+        setStatusMsg("Check your email for the reset link.");
         return;
       }
+      setStatusMsg(error.message);
     } catch {
-      // ignore
+      setStatusMsg("Unable to send reset email.");
     }
-
-    // Local reset fallback (deletes local data)
-    const usersNow = lsGet<UserRec[]>(KEY_USERS) ?? [];
-    const filtered = usersNow.filter((u) => normalizeEmail(u.email) !== email);
-    lsSet(KEY_USERS, filtered);
-    lsDel(`${KEY_ACCOUNTS_PREFIX}${email}`);
-    lsDel(`${KEY_SETTINGS_PREFIX}${email}`);
-    lsDel(KEY_SESSION);
-    setSession(null);
-    setStatusMsg("Local reset complete. Create the account again.");
   }
 
   // ===== init / hydration =====
@@ -940,8 +1032,19 @@ export default function Page() {
       setSupabaseStatus("not-connected");
       return;
     }
+  }, []);
 
     let active = true;
+
+    const updateProfileForSession = async (userId: string | null) => {
+      if (!active) return;
+      if (!userId) {
+        setProfile(null);
+        return;
+      }
+      await loadProfile(userId);
+    };
+
     (async () => {
       try {
         const result = await supabase.auth.getSession();
@@ -949,6 +1052,7 @@ export default function Page() {
         console.log("Supabase getSession:", result);
         if (!active) return;
         setSupabaseStatus(result.error ? "not-connected" : "connected");
+        await updateProfileForSession(result.data.session?.user?.id ?? null);
       } catch (error) {
         // eslint-disable-next-line no-console
         console.log("Supabase getSession error:", error);
@@ -957,8 +1061,13 @@ export default function Page() {
       }
     })();
 
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      updateProfileForSession(session?.user?.id ?? null);
+    });
+
     return () => {
       active = false;
+      data.subscription.unsubscribe();
     };
   }, []);
 
@@ -985,7 +1094,7 @@ export default function Page() {
       if (emailNorm) {
         lsSet(onboardingKey(emailNorm), {
           completed: true,
-          goals: goalSelections,
+          goals: selectedGoals,
           focus: workSelections,
           completedAt: Date.now(),
         });
@@ -993,11 +1102,8 @@ export default function Page() {
       setOnboardingStep(null);
       setTab("dashboard");
     }, 5000);
-
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [onboardingStep, emailNorm, goalSelections, workSelections]);
+    return () => window.clearTimeout(timer);
+  }, [onboardingStep, emailNorm, selectedGoals, workSelections]);
 
   // ===== derived numbers =====
   const totals = useMemo(() => {
@@ -1074,11 +1180,21 @@ export default function Page() {
   }
 
   const selectedAccount = accounts.find((a) => a.id === selectedAccountId) ?? null;
+  const selectedTotals = useMemo(() => {
+    if (!selectedAccount) return null;
+    const totalDebt = Math.max(0, selectedAccount.balance);
+    const totalMin = Math.max(0, selectedAccount.minPay);
+    const interestThisMonth = totalDebt * monthlyRate(selectedAccount.apr);
+    return { totalDebt, totalMin, interestThisMonth };
+  }, [selectedAccount]);
 
   // ===== UI pieces =====
   function renderHeader() {
     const signedName = plan === "guest" ? "Guest" : (currentUser?.displayName?.trim() || "Signed in");
-    const supabaseLabel = supabaseStatus === "connected" ? "Supabase: Connected" : "Supabase: Not connected";
+    const supabaseIsConfigured = Boolean(
+      process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+    );
+    const showSupabaseWarning = process.env.NODE_ENV === "development" && !supabaseIsConfigured;
     return (
       <div style={{ maxWidth: 1100, margin: "0 auto", padding: "22px 16px 8px" }}>
         <div
@@ -1113,9 +1229,9 @@ export default function Page() {
           </div>
 
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-            <Pill>Plan: {plan === "guest" ? "Guest" : session?.plan === "pro" ? "Pro" : "Basic"}</Pill>
             <Pill>{signedName}</Pill>
-            <Pill>{supabaseLabel}</Pill>
+            {isPro && <Pill>Pro ✨</Pill>}
+            {showSupabaseWarning && <Pill>Supabase: not configured</Pill>}
             {plan === "guest" ? (
               <Button variant="ghost" onClick={() => setTab("profile")}>
                 Sign in
@@ -1155,10 +1271,13 @@ export default function Page() {
               Create Basic to save locally. Promo unlocks Pro.
             </div>
           </div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <Button onClick={() => { setAuthMode("create"); setSelectedPlan("basic"); setTab("profile"); }}>
-              Create Basic
-            </Button>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <Button onClick={() => { setAuthMode("create"); setSelectedPlan("basic"); setTab("profile"); }}>
+                Create Basic
+              </Button>
+              {isPro && <span style={{ fontWeight: 900 }}>Pro ✨</span>}
+            </div>
             <Button variant="ghost" onClick={() => { setAuthMode("signin"); setTab("profile"); }}>
               Sign in
             </Button>
@@ -1239,39 +1358,68 @@ export default function Page() {
           </div>
 
           <div style={{ display: "grid", gap: 14 }}>
-            {isPro ? (
-              <>
-                <Card>
-                  <div style={{ display: "grid", gap: 10 }}>
-                    <div style={{ fontWeight: 1000, fontSize: 16 }}>Pro insight: snapshot</div>
-                    <div style={{ fontWeight: 900, opacity: 0.8 }}>
-                      {money(totals.interestThisMonth)} interest / {money(totals.totalMin)} minimums
-                    </div>
-                    <div style={{ fontWeight: 900, opacity: 0.8 }}>Total debt: {money(totals.totalDebt)}</div>
-                    <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.7 }}>
-                      This uses all accounts (not one).
-                    </div>
-                  </div>
-                </Card>
-
-                <Card>
-                  <div style={{ fontWeight: 1000, fontSize: 16, marginBottom: 10 }}>Quick totals</div>
-                  <div style={{ display: "grid", gap: 6, fontWeight: 900, opacity: 0.85 }}>
-                    <div>Total debt: {money(totals.totalDebt)}</div>
-                    <div>Total min pay: {money(totals.totalMin)}</div>
-                    <div>Interest/mo: {money(totals.interestThisMonth)}</div>
-                  </div>
-                </Card>
-              </>
-            ) : (
+            <div style={{ position: "relative" }}>
               <Card>
-                <div style={{ display: "grid", gap: 8 }}>
-                  <div style={{ fontWeight: 1000, fontSize: 16 }}>Quick view</div>
-                  <div style={{ fontWeight: 900, opacity: 0.75 }}>Only available in Pro.</div>
+                <div style={{ display: "grid", gap: 10 }}>
+                  <div style={{ fontWeight: 1000, fontSize: 16 }}>Pro insight: snapshot</div>
+                  <div style={{ fontWeight: 900, opacity: 0.8 }}>
+                    {money(totals.interestThisMonth)} interest / {money(totals.totalMin)} minimums
+                  </div>
+                  <div style={{ fontWeight: 900, opacity: 0.8 }}>Total debt: {money(totals.totalDebt)}</div>
+                  <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.7 }}>
+                    This uses all accounts (not one).
+                  </div>
                 </div>
               </Card>
-            )}
 
+              {isPro ? (
+                <div style={{ position: "absolute", right: 12, bottom: -12, width: "min(260px, 85%)" }}>
+                  <Card
+                    style={{
+                      background: "rgba(225,238,255,0.92)",
+                      border: "1px solid rgba(37,99,235,0.35)",
+                    }}
+                  >
+                    <div style={{ fontWeight: 1000, fontSize: 16, marginBottom: 10 }}>Quick totals</div>
+                    {selectedTotals ? (
+                      <div style={{ display: "grid", gap: 6, fontWeight: 900, opacity: 0.85 }}>
+                        <div>Total debt: {money(selectedTotals.totalDebt)}</div>
+                        <div>Total min pay: {money(selectedTotals.totalMin)}</div>
+                        <div>Interest/mo: {money(selectedTotals.interestThisMonth)}</div>
+                      </div>
+                    ) : (
+                      <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                        Select an account to see totals.
+                      </div>
+                    )}
+                  </Card>
+                </div>
+              ) : (
+                <div
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    background: "rgba(255,255,255,0.85)",
+                    borderRadius: 18,
+                    border: "1px solid rgba(0,0,0,0.08)",
+                    display: "grid",
+                    placeItems: "center",
+                    textAlign: "center",
+                    padding: 16,
+                  }}
+                >
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <div style={{ fontWeight: 1000, fontSize: 16 }}>Pro insight locked</div>
+                    <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                      Unlock Pro to view insights and Quick totals.
+                    </div>
+                    <Button variant="primary" onClick={() => { setPaywallError(null); setPaywallOpen(true); }}>
+                      Unlock Pro
+                    </Button>
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -1327,17 +1475,13 @@ export default function Page() {
           </div>
 
           {!isLoading && onboardingStep === "goals" && (
-            <div style={{ display: "grid", gap: 8 }}>
-              {ONBOARDING_GOALS.map((goal) => (
-                <label key={goal} style={{ display: "flex", alignItems: "center", gap: 10, fontWeight: 900 }}>
-                  <input
-                    type="checkbox"
-                    checked={goalSelections.includes(goal)}
-                    onChange={() => setGoalSelections((prev) => toggleItem(prev, goal))}
-                  />
-                  <span>{goal}</span>
-                </label>
-              ))}
+            <div style={{ display: "grid", gap: 10 }}>
+              <div style={{ fontWeight: 900, opacity: 0.75 }}>
+                Selected: {selectedGoals.length}
+              </div>
+              <Button variant="ghost" onClick={() => setOpenGoals(true)}>
+                Choose goals
+              </Button>
             </div>
           )}
 
@@ -1389,11 +1533,71 @@ export default function Page() {
                     setOnboardingStep("loading");
                   }
                 }}
+                disabled={onboardingStep === "goals" && selectedGoals.length === 0}
               >
                 Next
               </Button>
             )}
           </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderPaywallModal() {
+    if (!paywallOpen || isPro) return null;
+    return (
+      <div
+        style={{
+          position: "fixed",
+          inset: 0,
+          background: "rgba(8,12,10,0.55)",
+          display: "grid",
+          placeItems: "center",
+          zIndex: 999,
+          padding: 16,
+        }}
+        onClick={() => setPaywallOpen(false)}
+      >
+        <div
+          style={{
+            width: "min(520px, 96vw)",
+            background: "rgba(255,255,255,0.98)",
+            borderRadius: 22,
+            padding: 24,
+            border: "1px solid rgba(0,0,0,0.12)",
+            boxShadow: "0 20px 60px rgba(0,0,0,0.25)",
+            display: "grid",
+            gap: 16,
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontSize: 20, fontWeight: 1000 }}>Unlock Pro</div>
+            <button
+              onClick={() => setPaywallOpen(false)}
+              style={{ fontSize: 12, fontWeight: 700, color: "rgba(15,27,18,0.7)", border: "none", background: "transparent" }}
+            >
+              Close
+            </button>
+          </div>
+          <div style={{ fontWeight: 900, opacity: 0.75 }}>
+            Choose a plan to unlock Pro insights and quick totals.
+          </div>
+          <div style={{ display: "grid", gap: 10 }}>
+            <Button onClick={() => startCheckout("monthly")} disabled={checkoutPlan === "monthly"}>
+              {checkoutPlan === "monthly" ? "Loading..." : "Monthly $2.99"}
+            </Button>
+            <Button onClick={() => startCheckout("yearly")} disabled={checkoutPlan === "yearly"}>
+              {checkoutPlan === "yearly" ? "Loading..." : "Yearly $19.99"}
+            </Button>
+            <Button onClick={() => startCheckout("lifetime")} disabled={checkoutPlan === "lifetime"}>
+              {checkoutPlan === "lifetime" ? "Loading..." : "Lifetime $49.99 (limited time)"}
+            </Button>
+          </div>
+          {paywallError && (
+            <div style={{ fontWeight: 900, color: "#b91c1c" }}>{paywallError}</div>
+          )}
         </div>
       </div>
     );
@@ -1418,6 +1622,7 @@ export default function Page() {
 
           {accounts.map((a) => {
             const isOpen = selectedAccountId === a.id;
+            const isSelected = selectedAccountId === a.id;
 
             // derived
             const usagePct = a.limit > 0 ? clamp((a.balance / a.limit) * 100, 0, 999) : 0;
@@ -1427,7 +1632,18 @@ export default function Page() {
             const stalled = minOnly.stalled && a.balance > 0.01 && a.minPay <= 0;
 
             return (
-              <Card key={a.id}>
+              <Card
+                key={a.id}
+                onClick={() => setSelectedAccountId(a.id)}
+                style={
+                  isSelected
+                    ? {
+                        border: "1px solid rgba(37,99,235,0.55)",
+                        background: "rgba(219,234,254,0.7)",
+                      }
+                    : undefined
+                }
+              >
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap" }}>
                   <div style={{ display: "grid", gap: 6 }}>
                     <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
@@ -1803,7 +2019,7 @@ export default function Page() {
       authMode === "create"
         ? [
             { value: "basic", label: "Basic" },
-            { value: "pro", label: "Pro )" },
+            { value: "pro", label: "Pro" },
           ]
         : [{ value: "basic", label: "Basic" }];
 
@@ -1892,7 +2108,7 @@ export default function Page() {
                     <div style={{ display: "grid", gap: 6 }}>
                       <div style={{ fontSize: 12, fontWeight: 900, opacity: 0.75 }}>Plan</div>
                       <div style={{ padding: "11px 12px", borderRadius: 12, border: "1px solid rgba(0,0,0,0.16)", background: "rgba(255,255,255,0.78)", fontWeight: 1000 }}>
-                        {session?.plan === "pro" ? "Pro" : "Basic"}
+                        {isPro ? "Pro" : "Basic"}
                       </div>
                     </div>
                   </div>
@@ -1919,14 +2135,16 @@ export default function Page() {
               </div>
             </Card>
 
-            <Card>
-              <div style={{ fontWeight: 1000, marginBottom: 8 }}>Quick totals</div>
-              <div style={{ fontWeight: 900, opacity: 0.85, display: "grid", gap: 6 }}>
-                <div>Total debt: {money(totals.totalDebt)}</div>
-                <div>Total min pay: {money(totals.totalMin)}</div>
-                <div>Interest/mo: {money(totals.interestThisMonth)}</div>
-              </div>
-            </Card>
+            {isPro && (
+              <Card>
+                <div style={{ fontWeight: 1000, marginBottom: 8 }}>Quick totals</div>
+                <div style={{ fontWeight: 900, opacity: 0.85, display: "grid", gap: 6 }}>
+                  <div>Total debt: {money(totals.totalDebt)}</div>
+                  <div>Total min pay: {money(totals.totalMin)}</div>
+                  <div>Interest/mo: {money(totals.interestThisMonth)}</div>
+                </div>
+              </Card>
+            )}
 
             {/* Graphic requirement (even here it’s fine) */}
             <Card>
@@ -1948,6 +2166,14 @@ export default function Page() {
       `}</style>
 
       {renderOnboardingOverlay()}
+      <GoalsModal
+        open={openGoals}
+        selected={selectedGoals}
+        onToggle={(goal) => setSelectedGoals((prev) => toggleItem(prev, goal))}
+        onClose={() => setOpenGoals(false)}
+        onNext={() => setOpenGoals(false)}
+      />
+      {renderPaywallModal()}
       {renderHeader()}
       {renderGuestBanner()}
       {renderTabs()}
