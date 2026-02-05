@@ -887,7 +887,6 @@ export default function Page() {
     const pw = authPassword;
 
     if (!email.includes("@")) return setStatusMsg("Enter a valid email.");
-    if (pw.length === 0) return setStatusMsg("Enter your password.");
 
     const usersNow = lsGet<UserRec[]>(KEY_USERS) ?? [];
     const u = usersNow.find((x) => normalizeEmail(x.email) === email);
@@ -913,6 +912,7 @@ export default function Page() {
     setTab("dashboard");
     startOnboarding(email);
     setStatusMsg("Signed in.");
+    startOnboarding(email);
   }
 
   function signOut() {
@@ -1032,6 +1032,7 @@ export default function Page() {
       setSupabaseStatus("not-connected");
       return;
     }
+  }, []);
 
     let active = true;
 
